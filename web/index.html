@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>乱杀跑团</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>🔪 乱杀跑团</h1>
+    <p>规则版本：乱杀法则 1.1 + 新增限定</p>
+  </header>
+
+  <main>
+    <!-- 大厅视图 -->
+    <section id="lobby-view" class="panel">
+      <h2>创建或加入房间</h2>
+      <div class="form-row">
+        <label>你的昵称</label>
+        <input id="player-name" type="text" placeholder="例如：小明" value="">
+      </div>
+      <div class="form-row">
+        <label>创建房间</label>
+        <input id="room-name" type="text" placeholder="房间名（可留空）" value="">
+        <select id="room-mode">
+          <option value="auto">系统自动判定</option>
+          <option value="gm">GM 裁决模式</option>
+        </select>
+        <button onclick="createRoom()">创建</button>
+      </div>
+      <div class="form-row">
+        <label>加入房间</label>
+        <input id="join-room-id" type="number" min="1" placeholder="房间ID">
+        <button onclick="joinRoom()">加入</button>
+      </div>
+      <p class="hint">单局支持 4～7 人，人数不足可添加 AI。</p>
+      <div class="form-row">
+        <button onclick="openAIConfig()">🧪 测试 AI 接口</button>
+        <span id="ai-test-result" class="hint"></span>
+      </div>
+    </section>
+
+    <!-- 游戏视图 -->
+    <section id="game-view" class="panel hidden">
+      <div id="room-header"></div>
+      <div id="player-list"></div>
+      <div id="limit-banner"></div>
+      <div id="narrative-list"></div>
+      <div id="warning-list"></div>
+      <div id="game-actions"></div>
+    </section>
+  </main>
+
+  <div id="ai-config-modal" class="modal-overlay hidden">
+    <div class="modal">
+      <h2>配置 AI 接口</h2>
+      <p class="hint">用于 AI 判断濒死 / AI 玩家发言 / 随机判定。不配置也能玩（回退关键词判断）。</p>
+      <div class="form-row">
+        <label>接口地址</label>
+        <input id="ai-url" type="text" placeholder="https://token.sensenova.cn/v1/chat/completions">
+      </div>
+      <div class="form-row">
+        <label>模型名</label>
+        <input id="ai-model" type="text" placeholder="sensenova-6.8-flash-lite">
+      </div>
+      <div class="form-row">
+        <label>API Key</label>
+        <input id="ai-key" type="password" placeholder="sk-xxx（本地 Ollama 可留空）">
+      </div>
+      <p class="hint">配置会保存到服务器本地文件 luansha_ai.conf，重启后仍生效。</p>
+      <div class="form-row">
+        <button onclick="saveAIConfig()">保存并测试</button>
+        <button onclick="closeAIConfig()">关闭</button>
+      </div>
+      <span id="ai-config-result" class="hint"></span>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

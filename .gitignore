@@ -1,0 +1,16 @@
+# 构建产物
+*.o
+luansha
+luansha.exe
+build/
+
+# 本地密钥与 AI 配置（Phase 0：禁止提交 API Key）
+.luansha_key
+luansha_ai.conf
+*.local.env
+
+# 数据（Phase 1 持久化后会用到）
+*.db
+*.sqlite
+*.sqlite3
+data/
