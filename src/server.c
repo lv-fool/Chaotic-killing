@@ -41,6 +41,26 @@
 #define RATE_LIMIT_WINDOW_SEC 10
 #define RATE_LIMIT_MAX_REQS 120
 
+static int rate_limit_window_sec(void)
+{
+    const char *s = getenv("LUANSHA_RATE_LIMIT_WINDOW");
+    if (s && *s) {
+        int v = atoi(s);
+        if (v > 0) return v;
+    }
+    return RATE_LIMIT_WINDOW_SEC;
+}
+
+static int rate_limit_max_reqs(void)
+{
+    const char *s = getenv("LUANSHA_RATE_LIMIT_MAX");
+    if (s && *s) {
+        int v = atoi(s);
+        if (v > 0) return v;
+    }
+    return RATE_LIMIT_MAX_REQS;
+}
+
 static const char *WEB_ROOT = "web";
 
 /* ------------------------------------------------------------------ */
@@ -455,12 +475,14 @@ static void handle_api(socket_t client, HttpRequest *req)
     if (strcmp(path, "/api/room/add_ai") == 0 && strcmp(req->method, "POST") == 0) {
         JsonValue *v = json_parse(req->body);
         int room_id, r;
+        const char *token;
         if (!v) { send_error_json(client, "Invalid JSON"); return; }
         room_id = json_get_int(v, "room_id", 0);
+        token = json_get_string(v, "token", "");
         r = game_add_ai(room_id);
         json_free(v);
         if (r < 0) { send_error_json(client, "Add AI failed"); return; }
-        send_api_success_with_state(client, room_id, "");
+        send_api_success_with_state(client, room_id, token);
         return;
     }
 
@@ -483,13 +505,23 @@ static void handle_api(socket_t client, HttpRequest *req)
         JsonValue *v = json_parse(req->body);
         int room_id, fill_ai, r;
         const char *token;
+        const char *err = "Start failed";
         if (!v) { send_error_json(client, "Invalid JSON"); return; }
         room_id = json_get_int(v, "room_id", 0);
         token = json_get_string(v, "token", "");
         fill_ai = json_get_int(v, "fill_ai", 1);
         r = game_start(room_id, token, fill_ai);
         json_free(v);
-        if (r < 0) { send_error_json(client, "Start failed"); return; }
+        if (r < 0) {
+            if (r == -1) err = "房间或玩家不存在";
+            else if (r == -2) err = "房间不在等待状态";
+            else if (r == -3) err = "只有房主可以开始游戏";
+            else if (r == -4) err = "至少需要4名玩家";
+            else if (r == -5) err = "玩家数量超过上限";
+            else if (r == -6) err = "还有真人玩家未准备";
+            send_error_json(client, err);
+            return;
+        }
         send_api_success_with_state(client, room_id, token);
         return;
     }
@@ -706,15 +738,15 @@ static int rate_allow(const char *ip, time_t now)
             continue;
         }
         if (strcmp(g_rate[i].ip, ip) == 0) {
-            if (now - g_rate[i].window_start >= RATE_LIMIT_WINDOW_SEC) {
+            if (now - g_rate[i].window_start >= rate_limit_window_sec()) {
                 g_rate[i].window_start = now;
                 g_rate[i].count = 1;
                 return 1;
             }
             g_rate[i].count++;
-            return g_rate[i].count <= RATE_LIMIT_MAX_REQS;
+            return g_rate[i].count <= rate_limit_max_reqs();
         }
-        if (expired_slot < 0 && now - g_rate[i].window_start >= RATE_LIMIT_WINDOW_SEC) {
+        if (expired_slot < 0 && now - g_rate[i].window_start >= rate_limit_window_sec()) {
             expired_slot = i;
         }
     }

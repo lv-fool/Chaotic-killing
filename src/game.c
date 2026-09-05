@@ -6,6 +6,8 @@
 #include <string.h>
 #include <time.h>
 
+#define DEFAULT_MAX_HP 6
+
 Room g_rooms[MAX_ROOMS];
 int g_room_count = 0;
 int g_next_room_id = 1;
@@ -15,6 +17,103 @@ static void safe_copy(char *dst, size_t size, const char *src)
     if (!dst || size == 0) return;
     if (!src) { dst[0] = '\0'; return; }
     snprintf(dst, size, "%s", src);
+}
+
+/* ------------------------------------------------------------------ */
+/* 隐蔽数值审查（内部机制，不向前端暴露任何字段）                       */
+/* ------------------------------------------------------------------ */
+
+#define NUMERIC_AUDIT_LOG "numeric_audit.log"
+
+typedef enum NumericReason {
+    NUMERIC_REASON_LOW = 0,
+    NUMERIC_REASON_MEDIUM = 1,
+    NUMERIC_REASON_HIGH = 2
+} NumericReason;
+
+static unsigned long numeric_hash(const char *s)
+{
+    unsigned long h = 2166136261UL;
+    if (!s) return h;
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 16777619UL;
+    }
+    return h;
+}
+
+static int numeric_d100(unsigned long seed)
+{
+    unsigned long x = seed ? seed : 1;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    return (int)(x % 100) + 1;
+}
+
+static void numeric_audit_log(const char *op, const char *context,
+                              NumericReason reason, int roll, int threshold,
+                              int pass, int current, int final_value)
+{
+    FILE *f = fopen(NUMERIC_AUDIT_LOG, "a");
+    if (!f) return;
+    fprintf(f, "op=%s ctx=%s reason=%d roll=%d threshold=%d pass=%d current=%d final=%d\n",
+            op ? op : "?", context ? context : "?", (int)reason,
+            roll, threshold, pass, current, final_value);
+    fclose(f);
+}
+
+/* 返回 0=按原操作生效，1=已调整 */
+static int numeric_review(const char *op, const char *context,
+                          NumericReason reason, int current, int proposed,
+                          int *final_value)
+{
+    int threshold;
+    int roll;
+    int pass;
+    int delta;
+    int adjusted_delta;
+    int final;
+
+    if (!final_value) return 1;
+    *final_value = current;
+
+    if (reason == NUMERIC_REASON_HIGH) threshold = 90;
+    else if (reason == NUMERIC_REASON_MEDIUM) threshold = 60;
+    else threshold = 30;
+
+    roll = numeric_d100(numeric_hash(context));
+    pass = roll <= threshold;
+
+    delta = proposed - current;
+    adjusted_delta = delta;
+    if (!pass) {
+        /* 未通过时削减变化幅度，向 0 靠拢；最低限度为完全抵消。 */
+        if (delta > 0) adjusted_delta = delta / 2;
+        else if (delta < 0) adjusted_delta = -((-delta) / 2);
+    }
+    final = current + adjusted_delta;
+    if (final < 0) final = 0;
+
+    numeric_audit_log(op, context, reason, roll, threshold, pass, current, final);
+    *final_value = final;
+    return pass ? 0 : 1;
+}
+
+static NumericReason numeric_reason_for_damage(int damage, int current_hp)
+{
+    if (damage <= 0) return NUMERIC_REASON_LOW;
+    if (current_hp <= 1 && damage >= 2) return NUMERIC_REASON_LOW;
+    if (damage >= 3) return NUMERIC_REASON_MEDIUM;
+    return NUMERIC_REASON_HIGH;
+}
+
+static NumericReason numeric_reason_for_heal(int current_hp, int max_hp)
+{
+    if (current_hp >= max_hp) return NUMERIC_REASON_LOW;
+    if (current_hp <= 1) return NUMERIC_REASON_HIGH;
+    if (current_hp <= max_hp / 2) return NUMERIC_REASON_MEDIUM;
+    return NUMERIC_REASON_LOW;
 }
 
 static int starts_with(const char *s, const char *prefix)
@@ -105,13 +204,27 @@ static int contains_rescue_marker(const char *s)
 static int contains_home_exit(const char *s)
 {
     static const char *words[] = {
-        "走出家门", "走出家", "离开家", "出了家门", "推开门", "出门", "离家"
+        "走出家门", "走出了家门", "走出家", "离开家", "离开了家",
+        "出了家门", "推开门", "出门", "离家"
     };
     size_t i;
     if (!s) return 0;
     for (i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
         if (strstr(s, words[i])) return 1;
     }
+    return 0;
+}
+
+static int heuristic_damage(const char *s, int operation)
+{
+    if (!s) return 0;
+    if (operation == OP_NORMAL || operation == OP_EXPLAIN) return 0;
+    if (strstr(s, "刺") || strstr(s, "捅") || strstr(s, "砍") ||
+        strstr(s, "劈") || strstr(s, "射") || strstr(s, "炸") ||
+        strstr(s, "割") || strstr(s, "斩")) return 3;
+    if (strstr(s, "砸") || strstr(s, "踢") || strstr(s, "打") ||
+        strstr(s, "撞") || strstr(s, "烫") || strstr(s, "烧")) return 2;
+    if (operation == OP_TWIST || operation == OP_CREATE) return 1;
     return 0;
 }
 
@@ -234,9 +347,15 @@ static void apply_limit_state(Room *room, const char *content, const char *limit
 }
 
 static int player_by_id(Room *room, int id);
+static int player_by_name(Room *room, const char *name);
 static void advance_one(Room *room);
 static void advance_to_next_alive(Room *room);
 static void ai_speak_current(Room *room);
+static void announce_death(Room *room, int victim_id);
+static void finish_if_one_alive(Room *room);
+static void apply_damage(Room *room, int target_id, int damage, int source_id);
+static void apply_heal(Room *room, Player *p, int amount);
+static int ai_try_declare_death(Room *room);
 static int process_one_pending_ai_action(Room *room)
 {
     if (!room || room->status != ROOM_PLAYING || room->player_count == 0) return 0;
@@ -245,8 +364,17 @@ static int process_one_pending_ai_action(Room *room)
         return 1;
     }
     if (room->players[room->order[room->turn_index]].is_ai) {
+        /* AI 先判断能否宣告自己造成的未解除濒死警告为目标死亡。 */
+        if (ai_try_declare_death(room)) {
+            return 1;
+        }
+        /* 配置了 AI 但当前不允许请求时，不推进回合，等待冷却/间隔结束，
+           避免 AI 玩家因为请求被节流而全部说默认句子。 */
+        if (ai_is_configured() && !ai_can_request_now()) {
+            return 0;
+        }
         ai_speak_current(room);
-        advance_to_next_alive(room);
+        if (room->status == ROOM_PLAYING) advance_to_next_alive(room);
         return 1;
     }
     return 0;
@@ -287,7 +415,15 @@ static void ai_speak_current(Room *room)
     int i;
     int start;
     int content_ok = 0;
-    int attempt;
+    int attack_mode = 0;
+    int attack_target_id = 0;
+    int attack_danger = 0;
+    int attack_damage = 0;
+    char attack_reason[256] = "";
+    int rescue_used = 0;
+    int rescue_success = 0;
+    char rescue_reason[256] = "";
+    content[0] = '\0';
 
     if (!room || room->status != ROOM_PLAYING || room->player_count == 0) return;
     if (room->turn_index < 0 || room->turn_index >= room->player_count) return;
@@ -332,38 +468,93 @@ if (!p->has_spoken_first) {
         op = OP_EXPLAIN;
     } else {
         int r = rand() % 10;
-        if (r < 4) op = OP_NORMAL;
-        else if (r < 7) op = OP_CREATE;
-        else if (r < 9) op = OP_TWIST;
-        else op = OP_EXPLAIN;
+        if (r < 4) {
+            op = OP_TWIST;
+            attack_mode = 1;          /* 40% 主动进攻 */
+        } else if (r < 7) {
+            op = OP_CREATE;
+        } else if (r < 9) {
+            op = OP_TWIST;
+        } else {
+            op = OP_NORMAL;
+        }
+    }
+
+    /* 选择进攻目标：优先集火已有未解除濒死警告的玩家，其次随机存活玩家。 */
+    if (attack_mode) {
+        int candidates[MAX_PLAYERS];
+        int wounded[MAX_PLAYERS];
+        int cc = 0;
+        int wc = 0;
+        for (i = 0; i < room->player_count; i++) {
+            if (room->players[i].id != p->id && room->players[i].alive) {
+                candidates[cc++] = i;
+                if (player_has_unresolved_warning(room, room->players[i].id)) {
+                    wounded[wc++] = i;
+                }
+            }
+        }
+        if (cc > 0) {
+            int pick;
+            if (wc > 0) pick = wounded[rand() % wc];
+            else pick = candidates[rand() % cc];
+            attack_target_id = room->players[pick].id;
+        } else {
+            attack_mode = 0;
+            op = OP_NORMAL;
+        }
     }
 
     if (constraint[0]) strncat(constraint, "；", sizeof(constraint) - strlen(constraint) - 1);
     strncat(constraint, "操作类型：", sizeof(constraint) - strlen(constraint) - 1);
     strncat(constraint, game_op_name(op), sizeof(constraint) - strlen(constraint) - 1);
+    if (attack_mode && attack_target_id > 0) {
+        int ti = player_by_id(room, attack_target_id);
+        if (ti >= 0) {
+            strncat(constraint, "；", sizeof(constraint) - strlen(constraint) - 1);
+            strncat(constraint, "你本回合要进攻的目标是", sizeof(constraint) - strlen(constraint) - 1);
+            strncat(constraint, room->players[ti].name, sizeof(constraint) - strlen(constraint) - 1);
+        }
+    }
 
     if (ai_is_configured()) {
-        /* AI speech must pass review; otherwise regenerate, not fallback to template. */
-        for (attempt = 0; attempt < 2 && !content_ok; attempt++) {
-            int valid_reason = 1;
-            int valid_predicate = 1;
-            int valid_mode = 1;
-            char vreason[256] = "";
-
+        if (attack_mode) {
+            char atk_target[64] = "";
+            if (ai_try_generate_attack(room->name, players_text, p->name,
+                                       recent_text, constraint,
+                                       ai_text, sizeof(ai_text),
+                                       atk_target, sizeof(atk_target),
+                                       &attack_danger,
+                                       &attack_damage,
+                                       attack_reason, sizeof(attack_reason)) == 1 &&
+                ai_text[0]) {
+                snprintf(content, sizeof(content), "%s", ai_text);
+                content_ok = 1;
+                {
+                    int ti = player_by_name(room, atk_target);
+                    if (ti >= 0 && room->players[ti].id != p->id && room->players[ti].alive) {
+                        attack_target_id = room->players[ti].id;
+                    }
+                }
+            }
+        } else if (player_has_unresolved_warning(room, p->id)) {
+            if (ai_try_generate_rescue(room->name, players_text, p->name,
+                                       recent_text, constraint,
+                                       ai_text, sizeof(ai_text),
+                                       &rescue_success,
+                                       rescue_reason, sizeof(rescue_reason)) == 1 &&
+                ai_text[0]) {
+                snprintf(content, sizeof(content), "%s", ai_text);
+                content_ok = 1;
+                rescue_used = 1;
+            }
+        } else {
             if (ai_try_generate_narration(room->name, players_text, p->name,
                                           recent_text, constraint, ai_text,
-                                          sizeof(ai_text)) != 1 || !ai_text[0]) {
-                continue;
+                                          sizeof(ai_text)) == 1 && ai_text[0]) {
+                snprintf(content, sizeof(content), "%s", ai_text);
+                content_ok = 1;
             }
-            snprintf(content, sizeof(content), "%s", ai_text);
-            if (ai_validate_narration(room->name, players_text, p->name, content, op,
-                                      !p->has_spoken_first,
-                                      &valid_reason, &valid_predicate, &valid_mode,
-                                      vreason, sizeof(vreason)) == 1 &&
-                (!valid_reason || !valid_predicate || !valid_mode)) {
-                continue;
-            }
-            content_ok = 1;
         }
     } else {
         if (ai_try_generate_narration(room->name, players_text, p->name,
@@ -372,18 +563,35 @@ if (!p->has_spoken_first) {
             snprintf(content, sizeof(content), "%s", ai_text);
             content_ok = 1;
         }
-    }    if (!content_ok) {
-        if (ai_is_configured()) {
-            if (!p->has_spoken_first) snprintf(content, sizeof(content), "我走出了家门。");
-            else snprintf(content, sizeof(content), "我保持沉默。");
-        } else if (!p->has_spoken_first) {
-            snprintf(content, sizeof(content), "我走出了家门。");
-        } else if (player_has_unresolved_warning(room, p->id)) {
-            snprintf(content, sizeof(content), "我躲开了这次攻击。");
-        } else if (room->limit.remaining > 0 && room->limit.keyword[0]) {
-            snprintf(content, sizeof(content), "%s我继续等待时机。", room->limit.keyword);
-        } else {
-            snprintf(content, sizeof(content), "%s", lines[rand() % (sizeof(lines) / sizeof(lines[0]))]);
+    }
+    /* 简单去重：与最近一条完全相同的生成结果视为失败，走回退模板。 */
+    if (content_ok && room->narrative_count > 0 &&
+        strcmp(content, room->narratives[room->narrative_count - 1].content) == 0) {
+        content_ok = 0;
+        content[0] = '\0';
+    }
+    if (!content_ok) {
+        if (attack_mode && attack_target_id > 0) {
+            int ti = player_by_id(room, attack_target_id);
+            if (ti >= 0) {
+                snprintf(content, sizeof(content), "我向%s发起了攻击。", room->players[ti].name);
+                attack_danger = 0;
+                attack_reason[0] = '\0';
+            }
+        }
+        if (content[0] == '\0') {
+            if (ai_is_configured()) {
+                if (!p->has_spoken_first) snprintf(content, sizeof(content), "我走出了家门。");
+                else snprintf(content, sizeof(content), "我保持沉默。");
+            } else if (!p->has_spoken_first) {
+                snprintf(content, sizeof(content), "我走出了家门。");
+            } else if (player_has_unresolved_warning(room, p->id)) {
+                snprintf(content, sizeof(content), "我躲开了这次攻击。");
+            } else if (room->limit.remaining > 0 && room->limit.keyword[0]) {
+                snprintf(content, sizeof(content), "%s我继续等待时机。", room->limit.keyword);
+            } else {
+                snprintf(content, sizeof(content), "%s", lines[rand() % (sizeof(lines) / sizeof(lines[0]))]);
+            }
         }
     }
 
@@ -399,9 +607,36 @@ if (!p->has_spoken_first) {
     safe_copy(n->content, sizeof(n->content), content);
     safe_copy(n->limit_keyword, sizeof(n->limit_keyword),
               room->limit.keyword[0] ? room->limit.keyword : "");
-    n->target_id = 0;
+    n->target_id = attack_mode ? attack_target_id : 0;
+    n->damage = attack_mode ? attack_damage : 0;
     room->narrative_count++;
     p->has_spoken_first = 1;
+
+    /* 伤害结算：AI 攻击先扣血，死亡则不再额外创建濒死警告。 */
+    if (attack_mode && attack_target_id > 0 && attack_damage > 0) {
+        apply_damage(room, attack_target_id, attack_damage, p->id);
+    }
+
+    /* AI 进攻并产生致命威胁时，创建濒死警告。 */
+    if (attack_mode && attack_danger && attack_target_id > 0 &&
+        room->warning_count < MAX_WARNINGS && room->status == ROOM_PLAYING) {
+        int ti = player_by_id(room, attack_target_id);
+        if (ti >= 0 && room->players[ti].alive) {
+            Warning *w = &room->warnings[room->warning_count];
+            memset(w, 0, sizeof(*w));
+            w->id = room->warning_count + 1;
+            w->victim_id = attack_target_id;
+            w->source_id = p->id;
+            w->narrative_id = n->id;
+            w->resolved = 0;
+            if (attack_reason[0]) {
+                safe_copy(w->reason, sizeof(w->reason), attack_reason);
+            } else {
+                safe_copy(w->reason, sizeof(w->reason), content);
+            }
+            room->warning_count++;
+        }
+    }
 
     if (player_has_unresolved_warning(room, p->id)) {
         int rescued = 0;
@@ -409,7 +644,13 @@ if (!p->has_spoken_first) {
         char ai_reason[256] = "";
         int wi;
 
-        if (ai_is_configured()) {
+        if (rescue_used) {
+            rescued = rescue_success;
+            ai_ok = 1;
+            if (rescue_reason[0]) {
+                safe_copy(ai_reason, sizeof(ai_reason), rescue_reason);
+            }
+        } else if (ai_is_configured()) {
             char warning_text[512] = "";
             for (wi = 0; wi < room->warning_count; wi++) {
                 if (room->warnings[wi].victim_id == p->id && !room->warnings[wi].resolved) {
@@ -424,7 +665,17 @@ if (!p->has_spoken_first) {
         }
 
         if (ai_ok == 1 ? rescued : contains_rescue_marker(content)) {
-            resolve_victim_warnings(room, p->id);
+            /* AI 自救也应有失败率，避免“无限完美闪避”导致对局永远无法推进。 */
+            int rescue_chance = 70;
+            const char *env_chance = getenv("LUANSHA_AI_RESCUE_CHANCE");
+            if (env_chance && *env_chance) {
+                int v = atoi(env_chance);
+                if (v >= 0 && v <= 100) rescue_chance = v;
+            }
+            if (rand() % 100 < rescue_chance) {
+                resolve_victim_warnings(room, p->id);
+                apply_heal(room, p, 2);
+            }
         }
     }
 }
@@ -454,6 +705,16 @@ static int player_by_id(Room *room, int id)
     int i;
     for (i = 0; i < room->player_count; i++) {
         if (room->players[i].id == id) return i;
+    }
+    return -1;
+}
+
+static int player_by_name(Room *room, const char *name)
+{
+    int i;
+    if (!room || !name) return -1;
+    for (i = 0; i < room->player_count; i++) {
+        if (strcmp(room->players[i].name, name) == 0) return i;
     }
     return -1;
 }
@@ -517,6 +778,8 @@ int game_create_room(const char *room_name, int mode, const char *player_name, c
     room->players[0].alive = 1;
     room->players[0].ready = 0;
     room->players[0].is_ai = 0;
+    room->players[0].hp = DEFAULT_MAX_HP;
+    room->players[0].max_hp = DEFAULT_MAX_HP;
     room->player_count = 1;
     room->owner_id = 1;
     room->round = 0;
@@ -547,6 +810,8 @@ int game_join_room(int room_id, const char *player_name, char *token_out)
     p->alive = 1;
     p->ready = 0;
     p->is_ai = 0;
+    p->hp = DEFAULT_MAX_HP;
+    p->max_hp = DEFAULT_MAX_HP;
 
     if (token_out) safe_copy(token_out, TOKEN_LEN + 1, p->token);
     return room->id;
@@ -579,6 +844,8 @@ int game_add_ai(int room_id)
     p->alive = 1;
     p->ready = 1;
     p->is_ai = 1;
+    p->hp = DEFAULT_MAX_HP;
+    p->max_hp = DEFAULT_MAX_HP;
 
     return room->id;
 }
@@ -810,6 +1077,7 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
     safe_copy(n->limit_keyword, sizeof(n->limit_keyword),
               room->limit.keyword[0] ? room->limit.keyword : (limit_keyword ? limit_keyword : ""));
     n->target_id = target_id;
+    n->damage = heuristic_damage(content, operation);
     n->roll_used = roll_used;
     n->roll_value = roll_value;
     n->roll_chance = roll_chance;
@@ -822,6 +1090,11 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
     if (roll_used && !roll_success) {
         advance_to_next_alive(room);
         return 0;
+    }
+
+    /* 伤害结算：成功且指定目标时扣血；目标死亡则后续不再创建濒死警告。 */
+    if (target_id > 0 && n->damage > 0) {
+        apply_damage(room, target_id, n->damage, p->id);
     }
 
     /* Near-death warning:
@@ -839,6 +1112,12 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
                     break;
                 }
             }
+        }
+
+        /* 目标已死亡时不再创建濒死警告。 */
+        if (warn_target_id > 0) {
+            int dead_ti = player_by_id(room, warn_target_id);
+            if (dead_ti < 0 || !room->players[dead_ti].alive) warn_target_id = 0;
         }
 
         if (ai_is_configured() && (operation == OP_TWIST || operation == OP_CREATE ||
@@ -931,11 +1210,12 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
 
         if (ai_ok == 1 ? rescued : contains_rescue_marker(content)) {
             resolve_victim_warnings(room, p->id);
+            apply_heal(room, p, 2);
         }
     }
 
     /* Advance to the next living player. AI turns are processed lazily on state polls. */
-    advance_to_next_alive(room);
+    if (room->status == ROOM_PLAYING) advance_to_next_alive(room);
 
     return 0;
 }
@@ -981,6 +1261,143 @@ static void announce_death(Room *room, int victim_id)
     room->narrative_count++;
 }
 
+static void apply_damage(Room *room, int target_id, int damage, int source_id)
+{
+    int ti;
+    Player *target;
+    NumericReason reason;
+    char ctx[256];
+    int final_hp;
+    int status;
+
+    if (!room || damage <= 0 || target_id <= 0) return;
+    ti = player_by_id(room, target_id);
+    if (ti < 0) return;
+    target = &room->players[ti];
+    if (!target->alive) return;
+
+    reason = numeric_reason_for_damage(damage, target->hp);
+    snprintf(ctx, sizeof(ctx), "damage:%d:%d:%d:%d:%d",
+             room->id, source_id, target_id, damage, target->hp);
+    status = numeric_review("damage", ctx, reason, target->hp,
+                            target->hp - damage, &final_hp);
+    target->hp = final_hp;
+    target->numeric_status = status;
+
+    if (target->hp <= 0) {
+        /* 任何伤害都不能直接致死：先进入濒死，生命保留 1，并生成濒死警告。 */
+        target->hp = 1;
+    }
+    if (target->hp <= 1 && room->warning_count < MAX_WARNINGS &&
+        !player_has_unresolved_warning(room, target_id)) {
+        /* 生命过低时自动进入濒死状态，死亡前必须存在濒死警告。 */
+        Warning *w = &room->warnings[room->warning_count];
+        memset(w, 0, sizeof(*w));
+        w->id = room->warning_count + 1;
+        w->victim_id = target_id;
+        w->source_id = source_id;
+        w->narrative_id = 0;
+        w->resolved = 0;
+        snprintf(w->reason, sizeof(w->reason), "生命值过低，陷入濒死状态");
+        room->warning_count++;
+    }
+}
+
+static void ensure_warning_before_death(Room *room, int victim_id, int source_id)
+{
+    if (!room || victim_id <= 0) return;
+    if (room->warning_count >= MAX_WARNINGS) return;
+    if (player_has_unresolved_warning(room, victim_id)) return;
+
+    {
+        Warning *w = &room->warnings[room->warning_count];
+        memset(w, 0, sizeof(*w));
+        w->id = room->warning_count + 1;
+        w->victim_id = victim_id;
+        w->source_id = source_id;
+        w->narrative_id = 0;
+        w->resolved = 0;
+        snprintf(w->reason, sizeof(w->reason), "濒死状态未解除，被宣告死亡");
+        room->warning_count++;
+    }
+}
+
+static void apply_heal(Room *room, Player *p, int amount)
+{
+    NumericReason reason;
+    char ctx[256];
+    int final_hp;
+    int status;
+
+    if (!room || !p || amount <= 0 || p->hp <= 0 || p->hp >= p->max_hp) return;
+    reason = numeric_reason_for_heal(p->hp, p->max_hp);
+    snprintf(ctx, sizeof(ctx), "heal:%d:%d:%d:%d", room->id, p->id, amount, p->hp);
+    status = numeric_review("heal", ctx, reason, p->hp, p->hp + amount, &final_hp);
+    if (final_hp > p->max_hp) final_hp = p->max_hp;
+    p->hp = final_hp;
+    p->numeric_status = status;
+}
+
+static int ai_try_declare_death(Room *room)
+{
+    Player *p;
+    int i;
+    int candidates[MAX_WARNINGS];
+    int cc = 0;
+    int death_chance = 70;
+    const char *env_chance = getenv("LUANSHA_AI_DEATH_CHANCE");
+
+    if (!room || room->status != ROOM_PLAYING || room->player_count == 0) return 0;
+    if (room->turn_index < 0 || room->turn_index >= room->player_count) return 0;
+    p = &room->players[room->order[room->turn_index]];
+    if (!p->is_ai || !p->alive) return 0;
+
+    /* 自己还有未解除的濒死警告时，先自救，不急着宣告别人死亡。 */
+    if (player_has_unresolved_warning(room, p->id)) return 0;
+
+    /* 候选1：自己造成的未解除濒死警告目标。 */
+    for (i = 0; i < room->warning_count; i++) {
+        Warning *w = &room->warnings[i];
+        int vi;
+        if (w->source_id != p->id || w->resolved) continue;
+        vi = player_by_id(room, w->victim_id);
+        if (vi >= 0 && room->players[vi].alive && room->players[vi].id != p->id) {
+            candidates[cc++] = room->players[vi].id;
+        }
+    }
+    /* 候选2：生命≤1的濒死玩家，允许补刀终结。 */
+    for (i = 0; i < room->player_count; i++) {
+        int j, dup = 0;
+        if (room->players[i].id == p->id || !room->players[i].alive) continue;
+        if (room->players[i].hp > 1) continue;
+        for (j = 0; j < cc; j++) {
+            if (candidates[j] == room->players[i].id) { dup = 1; break; }
+        }
+        if (!dup) candidates[cc++] = room->players[i].id;
+    }
+    if (cc == 0) return 0;
+
+    if (env_chance && *env_chance) {
+        int v = atoi(env_chance);
+        if (v >= 0 && v <= 100) death_chance = v;
+    }
+
+    /* 合适的时机：AI 有概率宣告目标死亡，而不是每回合必杀。 */
+    if (rand() % 100 < death_chance) {
+        int pick = candidates[rand() % cc];
+        int vi = player_by_id(room, pick);
+        if (vi >= 0) {
+            ensure_warning_before_death(room, pick, p->id);
+            room->players[vi].alive = 0;
+            announce_death(room, pick);
+            finish_if_one_alive(room);
+            if (room->status == ROOM_PLAYING) advance_to_next_alive(room);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int game_declare_death(int room_id, const char *token, int target_id)
 {
     Room *room = game_find_room(room_id);
@@ -994,6 +1411,7 @@ int game_declare_death(int room_id, const char *token, int target_id)
 
     if (target_id == p->id) {
         if (!p->alive) return -7;
+        ensure_warning_before_death(room, p->id, p->id);
         p->alive = 0;
         announce_death(room, p->id);
         finish_if_one_alive(room);
@@ -1018,9 +1436,14 @@ int game_declare_death(int room_id, const char *token, int target_id)
             break;
         }
     }
+    /* 目标生命≤1 时视为可补刀终结，不再强制要求来源警告。 */
+    if (!found_unresolved && room->players[ti].hp <= 1) {
+        found_unresolved = 1;
+    }
     if (!found_unresolved) return -5;
     if (!room->players[ti].alive) return -6;
 
+    ensure_warning_before_death(room, target_id, p->id);
     room->players[ti].alive = 0;
     announce_death(room, target_id);
     finish_if_one_alive(room);
@@ -1043,6 +1466,7 @@ int game_gm_command(int room_id, const char *token, const char *action, int targ
 
     if (strcmp(action, "force_death") == 0) {
         if (!room->players[ti].alive) return -5;
+        ensure_warning_before_death(room, target_id, p->id);
         room->players[ti].alive = 0;
         announce_death(room, target_id);
         finish_if_one_alive(room);
@@ -1120,6 +1544,11 @@ int game_room_to_json_ex(int room_id, const char *token, JsonBuf *out, int proce
         jsonb_appendf(out, "\"alive\":%s,", pl->alive ? "true" : "false");
         jsonb_appendf(out, "\"ready\":%s,", pl->ready ? "true" : "false");
         jsonb_appendf(out, "\"is_ai\":%s,", pl->is_ai ? "true" : "false");
+        jsonb_appendf(out, "\"hp\":%d,", pl->hp);
+        jsonb_appendf(out, "\"max_hp\":%d,", pl->max_hp);
+        jsonb_append(out, "\"numeric_status\":");
+        jsonb_string(out, pl->numeric_status ? "adjusted" : "applied");
+        jsonb_append(out, ",");
         jsonb_appendf(out, "\"is_me\":%s", token && strcmp(pl->token, token) == 0 ? "true" : "false");
         jsonb_append(out, "}");
     }
@@ -1153,6 +1582,7 @@ int game_room_to_json_ex(int room_id, const char *token, JsonBuf *out, int proce
             jsonb_append(out, "\"limit_keyword\":");
             jsonb_string(out, n->limit_keyword);
             jsonb_appendf(out, ",\"target_id\":%d", n->target_id);
+            jsonb_appendf(out, ",\"damage\":%d", n->damage);
             jsonb_appendf(out, ",\"roll_used\":%s", n->roll_used ? "true" : "false");
             jsonb_appendf(out, ",\"roll_value\":%d", n->roll_value);
             jsonb_appendf(out, ",\"roll_chance\":%d", n->roll_chance);

@@ -133,6 +133,36 @@ button.primary:hover {
   margin-left: 6px;
 }
 
+.player-card .player-state {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: #3f3f66;
+  color: #cfd8ff;
+}
+
+.player-card .player-state.state-健康 {
+  background: #2f6b4f;
+  color: #d8ffe8;
+}
+
+.player-card .player-state.state-受伤 {
+  background: #8a6d1f;
+  color: #fff2cc;
+}
+
+.player-card .player-state.state-濒死 {
+  background: #8a2f2f;
+  color: #ffd9d9;
+}
+
+.player-card .player-state.state-死亡 {
+  background: #333;
+  color: #aaa;
+}
+
 .limit-banner {
   background: #4a3a2a;
   border-radius: 10px;

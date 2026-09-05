@@ -24,6 +24,9 @@ typedef struct Player {
     int is_ai;
     int has_spoken_first;   /* 0 = hasn't spoken yet → first sentence requires "离家" */
     int last_roll_failed;   /* used as a small luck compensation weight */
+    int hp;                 /* current hit points */
+    int max_hp;             /* maximum hit points */
+    int numeric_status;     /* 0=applied, 1=adjusted; only final result exposed */
 } Player;
 
 typedef struct Narrative {
@@ -35,6 +38,7 @@ typedef struct Narrative {
     char content[MAX_CONTENT];
     char limit_keyword[64];
     int target_id;
+    int damage;         /* 0 = no damage, 1-3 = damage dealt */
     int roll_used;      /* 1 if a random check was performed */
     int roll_value;     /* 1..100 dice result */
     int roll_chance;    /* success threshold after weights */

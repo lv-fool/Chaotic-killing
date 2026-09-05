@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
 
 #ifdef _WIN32
   #include <winsock2.h>
@@ -35,6 +36,76 @@ static char g_ai_url[512];
 static char g_ai_model[128];
 static char g_ai_key[256];
 static int g_ai_runtime = 0;   /* 1 = 运行时/配置文件配置已加载，优先于环境变量 */
+
+/* AI 请求节流：防止轮询/AI 玩家发言频繁调用，触发服务商 RPM 限流。 */
+#define AI_MIN_INTERVAL_SEC 8          /* 两次 AI 请求之间最小间隔 */
+#define AI_RATE_LIMIT_COOLDOWN_SEC 60  /* 检测到 RPM/限流后的冷却时间 */
+
+static time_t g_ai_last_request = 0;
+static time_t g_ai_cooldown_until = 0;
+
+static int ai_min_interval_sec(void)
+{
+    const char *s = getenv("LUANSHA_AI_MIN_INTERVAL");
+    if (s && *s) {
+        int v = atoi(s);
+        if (v >= 0) return v;
+    }
+    return AI_MIN_INTERVAL_SEC;
+}
+
+static int ai_rate_limit_cooldown_sec(void)
+{
+    const char *s = getenv("LUANSHA_AI_RATE_LIMIT_COOLDOWN");
+    if (s && *s) {
+        int v = atoi(s);
+        if (v >= 0) return v;
+    }
+    return AI_RATE_LIMIT_COOLDOWN_SEC;
+}
+
+static int ai_rate_limited_response(const char *response)
+{
+    if (!response) return 0;
+    if (strstr(response, "RPM") || strstr(response, "rpm") ||
+        strstr(response, "rate limit") || strstr(response, "rate_limit") ||
+        strstr(response, "Rate Limit") || strstr(response, "Too Many Requests") ||
+        strstr(response, "exceeded") || strstr(response, "Exceeded") ||
+        strstr(response, "429")) {
+        return 1;
+    }
+    return 0;
+}
+
+static int ai_throttle_allow(time_t now)
+{
+    if (now < g_ai_cooldown_until) return 0;
+    if (now - g_ai_last_request < ai_min_interval_sec()) return 0;
+    g_ai_last_request = now;   /* 记录尝试时间，失败也会拉开间隔 */
+    return 1;
+}
+
+/* 只读检查：现在是否允许发起 AI 请求。用于游戏层决定“等待 AI 还是回退”。 */
+int ai_can_request_now(void)
+{
+    time_t now = time(NULL);
+    if (now < g_ai_cooldown_until) return 0;
+    if (now - g_ai_last_request < ai_min_interval_sec()) return 0;
+    return 1;
+}
+
+static void ai_throttle_mark(const char *response)
+{
+    time_t now = time(NULL);
+    g_ai_last_request = now;
+    if (ai_rate_limited_response(response)) {
+        g_ai_cooldown_until = now + ai_rate_limit_cooldown_sec();
+        fprintf(stderr,
+                "[AI] 检测到服务商限流（RPM exceeded 等），进入 %d 秒冷却，期间回退关键词/模板。\n",
+                ai_rate_limit_cooldown_sec());
+    }
+}
+
 
 static void ai_trim_crlf(char *str)
 {
@@ -248,28 +319,40 @@ static int https_post_json_via_curl(const char *url, const char *json_body,
     char cmd[8192];
     const char *api_key = ai_get_key();
     const char *curl = "curl";
+    const char *ssl_opt = "";
+    const char *retry_env = getenv("LUANSHA_AI_CURL_RETRY");
+    int curl_retry = retry_env ? atoi(retry_env) : 2;
+    char retry_opt[64];
     int rc;
 
 #ifdef _WIN32
     curl = "curl.exe";
+    /* Windows Schannel 默认会检查证书吊销，若吊销服务器离线会报
+       CRYPT_E_REVOCATION_OFFLINE；跳过吊销检查可让 HTTPS 请求继续。 */
+    ssl_opt = "--ssl-no-revoke";
 #endif
+    if (curl_retry < 0) curl_retry = 0;
+    snprintf(retry_opt, sizeof(retry_opt), "--retry %d --retry-delay 1", curl_retry);
+
+    /* 节流：冷却期或距上次请求太近时，直接失败并回退，不再打服务商。 */
+    if (!ai_throttle_allow(time(NULL))) return -1;
 
     if (!tmpnam(body_file) || !tmpnam(resp_file)) return -1;
     if (write_temp_file(body_file, json_body) != 0) return -1;
 
     if (api_key && *api_key) {
         snprintf(cmd, sizeof(cmd),
-                 "%s -sS --http1.1 --tlsv1.2 --keepalive-time 20 --keepalive-cnt 3 --retry 2 --retry-delay 1 --retry-all-errors --connect-timeout 15 -m 30 -X POST \"%s\" "
+                 "%s -sS --http1.1 --tlsv1.2 %s %s --keepalive-time 20 --keepalive-cnt 3 --connect-timeout 15 -m 30 -X POST \"%s\" "
                  "-H \"Content-Type: application/json\" "
                  "-H \"Authorization: Bearer %s\" "
                  "--data-binary \"@%s\" -o \"%s\"",
-                 curl, url, api_key, body_file, resp_file);
+                 curl, ssl_opt, retry_opt, url, api_key, body_file, resp_file);
     } else {
         snprintf(cmd, sizeof(cmd),
-                 "%s -sS --http1.1 --tlsv1.2 --keepalive-time 20 --keepalive-cnt 3 --retry 2 --retry-delay 1 --retry-all-errors --connect-timeout 15 -m 30 -X POST \"%s\" "
+                 "%s -sS --http1.1 --tlsv1.2 %s %s --keepalive-time 20 --keepalive-cnt 3 --connect-timeout 15 -m 30 -X POST \"%s\" "
                  "-H \"Content-Type: application/json\" "
                  "--data-binary \"@%s\" -o \"%s\"",
-                 curl, url, body_file, resp_file);
+                 curl, ssl_opt, retry_opt, url, body_file, resp_file);
     }
 
     rc = system(cmd);
@@ -279,6 +362,7 @@ static int https_post_json_via_curl(const char *url, const char *json_body,
         return -1;
     }
     remove(resp_file);
+    ai_throttle_mark(response);
     return 0;
 }
 
@@ -296,6 +380,9 @@ static int http_post_json(const char *url, const char *json_body,
     const char *body_start;
     const char *api_key;
     int req_len;
+
+    /* 节流：冷却期或距上次请求太近时，直接失败并回退。 */
+    if (!ai_throttle_allow(time(NULL))) return -1;
 
     if (parse_url(url, host, sizeof(host), &port, path, sizeof(path)) != 0) return -1;
     if (net_startup() != 0) return -1;
@@ -403,6 +490,7 @@ static int http_post_json(const char *url, const char *json_body,
     } else {
         snprintf(response, response_size, "%s", body_start);
     }
+    ai_throttle_mark(recv_buf);
     net_cleanup();
     return 0;
 }
@@ -485,6 +573,25 @@ static const char *json_find_first_string(const JsonValue *v)
         }
     }
     return NULL;
+}
+
+static int ai_json_is_error(const JsonValue *v)
+{
+    int i;
+    if (!v) return 0;
+    if (v->type == JSON_OBJECT) {
+        for (i = 0; i < v->count; i++) {
+            if (v->items[i]->key && strcmp(v->items[i]->key, "error") == 0) return 1;
+        }
+        for (i = 0; i < v->count; i++) {
+            if (ai_json_is_error(v->items[i])) return 1;
+        }
+    } else if (v->type == JSON_ARRAY) {
+        for (i = 0; i < v->count; i++) {
+            if (ai_json_is_error(v->items[i])) return 1;
+        }
+    }
+    return 0;
 }
 
 static const char *extract_generation_text(const JsonValue *root)
@@ -593,6 +700,13 @@ static int ai_complete_text(const char *system_prompt, const char *user_prompt,
             root = json_parse(tmp);
         }
         if (!root) return 0;
+    }
+
+    /* 服务商返回错误 JSON（如 RPM exceeded / 401）时，不能把错误文本当成 AI 回复。 */
+    if (ai_json_is_error(root)) {
+        if (debug && *debug) fprintf(stderr, "[AI] 服务商返回错误，已回退：%s\n", response);
+        json_free(root);
+        return 0;
     }
 
     text = extract_generation_text(root);
@@ -1045,8 +1159,13 @@ int ai_try_generate_narration(
         "请根据当前情况说出一句话的行动/发言。"
         "要求：只能说一句话；不能使用连词；不要直接操控其他玩家的主意识；"
         "不要使用固定的模板句，不要重复前面已经说过的话；"
-        "尽量自由创造独特、合理的行动，可以创造物品、设下陷阱、观察、移动、"
-        "试探、谈判、准备攻击等；"
+        "尽量自由创造独特、合理的行动；优先选择有攻击性的行动，"
+        "例如创造武器、设置陷阱、布置伏击、破坏环境、主动出击或制造威胁；"
+        "也可以观察、移动、试探、谈判；"
+        "必须给出具体动作，禁止只说“我向X发起攻击”这种笼统描述；"
+        "必须基于当前房间/场景中的真实物体和物理规则，禁止时间倒流、黑洞、"
+        "撕下影子/骨骼、数据化、超能力等脱离场景的设定；"
+        "不得复制或高度模仿其他玩家或自己之前的发言；"
         "不要输出解释、不要加引号、不要输出JSON。",
         ai_name ? ai_name : "");
 
@@ -1089,7 +1208,9 @@ int ai_try_generate_lethal(
         "1. 必须根据当前场景、玩家关系和最近发言，推断合理的致命方式；"
         "2. 只说一句话，不要用固定模板，不要直接说“我给了X致命一击”这种套话；"
         "3. 可以暗示陷阱、投毒、伏击、武器、环境利用等；"
-        "4. 不要输出解释、不要加引号、不要输出JSON。");
+        "4. 必须基于当前房间/场景中的真实物体和物理规则，禁止超能力/脱离场景设定；"
+        "5. 不得复制或高度模仿其他玩家或自己之前的发言；"
+        "6. 不要输出解释、不要加引号、不要输出JSON。");
 
     snprintf(user_prompt, sizeof(user_prompt),
         "房间名：%s\n在线玩家：%s\n攻击者：%s\n目标：%s\n最近发言：%s",
@@ -1102,4 +1223,192 @@ int ai_try_generate_lethal(
     ok = ai_complete_text(system_prompt, user_prompt, out, out_size);
     if (ok && debug && *debug) fprintf(stderr, "[AI] lethal ok: %s\n", out);
     return ok;
+}
+
+static int name_in_players(const char *players_text, const char *name)
+{
+    if (!players_text || !name || !*name) return 0;
+    return strstr(players_text, name) != NULL;
+}
+
+int ai_try_generate_attack(
+    const char *room_name,
+    const char *players_text,
+    const char *ai_name,
+    const char *recent_text,
+    const char *constraint,
+    char *content_out, size_t content_size,
+    char *target_out, size_t target_size,
+    int *danger_out,
+    int *damage_out,
+    char *reason_out, size_t reason_size)
+{
+    const char *debug = getenv("LUANSHA_AI_DEBUG");
+    char system_prompt[1400];
+    char user_prompt[2048];
+    char out[1024];
+    JsonValue *v = NULL;
+    const char *js, *je;
+    char tmp[1024];
+    const char *target, *content, *reason;
+    int danger = 0;
+    int damage = 0;
+    int ok;
+
+    if (!content_out || content_size == 0 || !target_out || target_size == 0 ||
+        !danger_out || !damage_out) return 0;
+    content_out[0] = '\0';
+    target_out[0] = '\0';
+    *danger_out = 0;
+    *damage_out = 0;
+    if (reason_out && reason_size > 0) reason_out[0] = '\0';
+
+    snprintf(system_prompt, sizeof(system_prompt),
+        "你是《乱杀法则》跑团游戏中的AI玩家%s。"
+        "请根据当前局势，选择一名其他玩家作为威胁/进攻目标，并写出你的一句话行动。"
+        "规则：只能说一句话；不能使用连词；不能直接操控其他玩家的主意识；"
+        "进攻必须符合当前场景和前面发言的铺垫，可以布置陷阱、使用已创造/已获得的物品、"
+        "利用环境、近战、投毒、伏击等，但必须逻辑合理。"
+        "必须给出具体动作，禁止只说“我向X发起攻击”这种笼统描述；"
+        "必须基于当前房间/场景中的真实物体和物理规则，禁止时间倒流、黑洞、"
+        "撕下影子/骨骼、数据化、超能力等脱离场景的设定；"
+        "不得复制或高度模仿其他玩家或自己之前的发言；"
+        "只输出JSON，不要输出其他文字，格式："
+        "{\"target\":\"目标玩家名\",\"content\":\"你的一句话行动\",\"danger\":true或false,\"damage\":1到3,\"reason\":\"简短原因\"}"
+        "其中danger表示这句话是否足以造成致命威胁/濒死状态，damage表示实际造成的伤害值（1=轻伤，2=重伤，3=致命）。",
+        ai_name ? ai_name : "");
+
+    snprintf(user_prompt, sizeof(user_prompt),
+        "房间名：%s\n在线玩家：%s\n你：%s\n最近发言：%s\n当前约束：%s",
+        room_name ? room_name : "未知",
+        players_text ? players_text : "无",
+        ai_name ? ai_name : "AI",
+        recent_text && *recent_text ? recent_text : "暂无",
+        constraint && *constraint ? constraint : "无");
+
+    if (ai_complete_text(system_prompt, user_prompt, out, sizeof(out)) != 1) return 0;
+
+    v = json_parse(out);
+    if (!v) {
+        js = find_json_in_text(out, &je);
+        if (js && (size_t)(je - js) < sizeof(tmp)) {
+            memcpy(tmp, js, (size_t)(je - js));
+            tmp[je - js] = '\0';
+            v = json_parse(tmp);
+        }
+        if (!v) return 0;
+    }
+
+    target = json_get_string(v, "target", "");
+    content = json_get_string(v, "content", "");
+    reason = json_get_string(v, "reason", "");
+    {
+        JsonValue *dv = json_get(v, "danger");
+        if (dv && dv->type == JSON_BOOL) danger = dv->boolean ? 1 : 0;
+        else danger = json_get_int(v, "danger", 0) ? 1 : 0;
+    }
+    damage = json_get_int(v, "damage", 0);
+    if (damage < 1) damage = 1;
+    if (damage > 3) damage = 3;
+
+    ok = (content[0] != '\0' && target[0] != '\0' && name_in_players(players_text, target));
+    if (ok) {
+        ai_set_value(content_out, content_size, content);
+        ai_set_value(target_out, target_size, target);
+        *danger_out = danger;
+        *damage_out = damage;
+        if (reason_out && reason_size > 0 && reason[0]) {
+            ai_set_value(reason_out, reason_size, reason);
+        }
+        if (debug && *debug) {
+            fprintf(stderr, "[AI] attack: target=%s danger=%d damage=%d content=%s\n",
+                    target_out, *danger_out, *damage_out, content_out);
+        }
+    }
+    json_free(v);
+    return ok ? 1 : 0;
+}
+
+int ai_try_generate_rescue(
+    const char *room_name,
+    const char *players_text,
+    const char *ai_name,
+    const char *recent_text,
+    const char *constraint,
+    char *content_out, size_t content_size,
+    int *rescued_out,
+    char *reason_out, size_t reason_size)
+{
+    const char *debug = getenv("LUANSHA_AI_DEBUG");
+    char system_prompt[1400];
+    char user_prompt[2048];
+    char out[1024];
+    JsonValue *v = NULL;
+    const char *js, *je;
+    char tmp[1024];
+    const char *content, *reason;
+    int rescued = 0;
+    int ok;
+
+    if (!content_out || content_size == 0 || !rescued_out) return 0;
+    content_out[0] = '\0';
+    *rescued_out = 0;
+    if (reason_out && reason_size > 0) reason_out[0] = '\0';
+
+    snprintf(system_prompt, sizeof(system_prompt),
+        "你是《乱杀法则》跑团游戏中的AI玩家%s。"
+        "你现在正处于濒死状态，必须立即自救。"
+        "请根据当前场景和已有铺垫，说出一句合理、简短的自救行动。"
+        "规则：只能说一句话；不能使用连词；不能直接操控其他玩家的主意识；"
+        "必须明确描述如何躲开/挡下/防御/化解/挣脱/恢复/逃离这次致命威胁；"
+        "自救必须基于当前场景中的物体、地形和身体状况，禁止变成非人形态、"
+        "时间倒流、数据化、超能力等脱离场景的设定；"
+        "不得复制或高度模仿其他玩家或自己之前的发言；"
+        "只输出JSON，不要输出其他文字，格式："
+        "{\"content\":\"你的一句话自救行动\",\"rescued\":true或false,\"reason\":\"简短原因\"}"
+        "其中rescued表示这句话是否足以让自己脱离濒死状态。",
+        ai_name ? ai_name : "");
+
+    snprintf(user_prompt, sizeof(user_prompt),
+        "房间名：%s\n在线玩家：%s\n你：%s\n最近发言：%s\n当前约束：%s",
+        room_name ? room_name : "未知",
+        players_text ? players_text : "无",
+        ai_name ? ai_name : "AI",
+        recent_text && *recent_text ? recent_text : "暂无",
+        constraint && *constraint ? constraint : "无");
+
+    if (ai_complete_text(system_prompt, user_prompt, out, sizeof(out)) != 1) return 0;
+
+    v = json_parse(out);
+    if (!v) {
+        js = find_json_in_text(out, &je);
+        if (js && (size_t)(je - js) < sizeof(tmp)) {
+            memcpy(tmp, js, (size_t)(je - js));
+            tmp[je - js] = '\0';
+            v = json_parse(tmp);
+        }
+        if (!v) return 0;
+    }
+
+    content = json_get_string(v, "content", "");
+    reason = json_get_string(v, "reason", "");
+    {
+        JsonValue *dv = json_get(v, "rescued");
+        if (dv && dv->type == JSON_BOOL) rescued = dv->boolean ? 1 : 0;
+        else rescued = json_get_int(v, "rescued", 0) ? 1 : 0;
+    }
+
+    ok = (content[0] != '\0');
+    if (ok) {
+        ai_set_value(content_out, content_size, content);
+        *rescued_out = rescued;
+        if (reason_out && reason_size > 0 && reason[0]) {
+            ai_set_value(reason_out, reason_size, reason);
+        }
+        if (debug && *debug) {
+            fprintf(stderr, "[AI] rescue: rescued=%d content=%s\n", *rescued_out, content_out);
+        }
+    }
+    json_free(v);
+    return ok ? 1 : 0;
 }

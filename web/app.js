@@ -213,7 +213,10 @@ async function testAIConnection() {
 
 async function addAI() {
   try {
-    const data = await api('/api/room/add_ai', { room_id: Number(state.room_id) });
+    const data = await api('/api/room/add_ai', {
+      room_id: Number(state.room_id),
+      token: state.token
+    });
     if (!data.ok) throw new Error(data.error || '添加AI失败');
     renderFromResponse(data);
   } catch (e) {
@@ -237,6 +240,17 @@ async function setReady(ready) {
 
 async function startGame(fillAI) {
   try {
+    /* 开始前如果自己还没准备，自动先准备，避免误点“开始”后被“未准备”拦截。 */
+    const cur = state.current;
+    const me = cur && cur.players.find(p => p.is_me);
+    if (me && !me.ready) {
+      const rdy = await api('/api/game/set_ready', {
+        room_id: Number(state.room_id),
+        token: state.token,
+        ready: 1
+      });
+      if (!rdy.ok) throw new Error(rdy.error || '准备失败');
+    }
     const data = await api('/api/game/start', {
       room_id: Number(state.room_id),
       token: state.token,
@@ -245,7 +259,7 @@ async function startGame(fillAI) {
     if (!data.ok) throw new Error(data.error || '开始失败');
     renderFromResponse(data);
   } catch (e) {
-    toast(e.message || '开始失败：需要4名玩家且全员准备');
+    toast(e.message || '开始失败');
   }
 }
 
@@ -444,15 +458,24 @@ function playerName(room, id) {
   return p ? p.name + (p.is_ai ? ' (AI)' : '') : '—';
 }
 
+function playerState(p) {
+  if (!p.alive) return '死亡';
+  if (p.hp === 1) return '濒死';
+  if (p.hp <= Math.floor((p.max_hp || 6) / 2)) return '受伤';
+  return '健康';
+}
+
 function renderPlayers(room) {
   const list = room.players.map(p => {
     const classes = ['player-card'];
     if (!p.alive) classes.push('dead');
     if (room.turn_player_id === p.id && room.status === 1) classes.push('current');
+    const state = playerState(p);
     return `<div class="${classes.join(' ')}">
       ${escaped(p.name)}${p.is_ai ? '<span class="ai-tag">AI</span>' : ''}
       ${p.is_me ? '（我）' : ''}
       ${!p.alive ? '💀' : ''}
+      <span class="player-state state-${state}">${state}</span>
     </div>`;
   }).join('');
   $('player-list').innerHTML = `<div>${list}</div>`;
@@ -522,12 +545,16 @@ function renderActions(room) {
   if (room.status === 0) {
     const mePlayer = room.players.find(p => p.is_me);
     const isReady = !!mePlayer.ready;
+    const isOwner = mePlayer.id === room.owner_id;
+    const startButtons = isOwner
+      ? `<button class="primary" onclick="startGame(true)">人不够的话，用 AI 补位并开始</button>
+          <button onclick="startGame(false)">直接开始（需满4人）</button>`
+      : `<span class="hint">等待房主开始…</span>`;
     box.innerHTML = `
       <div class="action-box">
         <div class="toolbar">
           <button onclick="setReady(${isReady ? 0 : 1})">${isReady ? '取消准备' : '准备'}</button>
-          <button class="primary" onclick="startGame(true)">人不够的话，用 AI 补位并开始</button>
-          <button onclick="startGame(false)">直接开始（需满4人）</button>
+          ${startButtons}
         </div>
       </div>`;
     return;

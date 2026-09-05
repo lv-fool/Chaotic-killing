@@ -27,6 +27,12 @@ const char *ai_get_model(void);
 const char *ai_get_key(void);
 
 /*
+ * Returns 1 if a new AI request is allowed right now (not in cooldown,
+ * and enough time has passed since the last request). Read-only.
+ */
+int ai_can_request_now(void);
+
+/*
  * Validate a human narration for reasonableness and single-predicate rule.
  * Returns 1 if AI made a judgment, 0 if unavailable/failed.
  */
@@ -112,5 +118,39 @@ int ai_try_generate_lethal(
     const char *recent_text,
     char *out,
     size_t out_size);
+
+/*
+ * Generate an aggressive AI-player narration that may create a near-death warning.
+ * The model chooses a target from the player list and outputs:
+ * {"target":"name","content":"one sentence","danger":true/false,"damage":1-3,"reason":"..."}
+ * Returns 1 on success and fills the outputs.
+ */
+int ai_try_generate_attack(
+    const char *room_name,
+    const char *players_text,
+    const char *ai_name,
+    const char *recent_text,
+    const char *constraint,
+    char *content_out, size_t content_size,
+    char *target_out, size_t target_size,
+    int *danger_out,
+    int *damage_out,
+    char *reason_out, size_t reason_size);
+
+/*
+ * Generate a self-rescue narration for an AI player who has a near-death warning.
+ * The model outputs JSON:
+ * {"content":"one sentence","rescued":true/false,"reason":"..."}
+ * Returns 1 on success and fills the outputs.
+ */
+int ai_try_generate_rescue(
+    const char *room_name,
+    const char *players_text,
+    const char *ai_name,
+    const char *recent_text,
+    const char *constraint,
+    char *content_out, size_t content_size,
+    int *rescued_out,
+    char *reason_out, size_t reason_size);
 
 #endif /* AI_H */
