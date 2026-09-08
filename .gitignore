@@ -14,3 +14,30 @@ luansha_ai.conf
 *.sqlite
 *.sqlite3
 data/
+
+# 客户端构建产物
+dist/
+runtime/
+build/
+luansha_client.exe
+luansha_client_py.spec
+luansha_client.exe.WebView2/
+luansha_client_WebView2Loader.dll
+WebView2Loader.dll
+
+# 日志与运行时数据
+debug_operations.log
+numeric_audit.log
+cloudflared.log
+cloudflared.exe
+
+# 预览/临时文件
+client_preview.html
+client_preview.png
+client_preview_mobile.html
+client_white_check.html
+client_white_check.png
+
+# Python
+__pycache__/
+*.pyc

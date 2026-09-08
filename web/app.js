@@ -105,6 +105,45 @@ function leaveRoom() {
   $('room-header').innerHTML = '';
   toast('已退出房间');
 }
+function quitGame() {
+  if (!confirm('确定退出游戏吗？')) return;
+  localStorage.removeItem(LS_ROOM);
+  localStorage.removeItem(LS_TOKEN);
+  state.room_id = '';
+  state.token = '';
+  state.current = null;
+  lastStateKey = '';
+  if (state.pollTimer) {
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.quit_app) {
+    window.pywebview.api.quit_app();
+    return;
+  }
+  try { window.close(); } catch (e) {}
+  location.reload();
+}
+
+async function startPublicTunnel() {
+  const el = $('public-tunnel-result');
+  if (!el) return;
+  if (!window.pywebview || !window.pywebview.api || !window.pywebview.api.start_tunnel) {
+    el.textContent = '请使用桌面客户端才能开启公网联机';
+    return;
+  }
+  el.textContent = '正在开启隧道…';
+  try {
+    const r = await window.pywebview.api.start_tunnel();
+    if (r && r.ok) {
+      el.innerHTML = '公网地址：<a href="' + r.url + '" target="_blank">' + r.url + '</a>';
+    } else {
+      el.textContent = (r && r.error) || '开启失败';
+    }
+  } catch (e) {
+    el.textContent = '开启失败：' + e.message;
+  }
+}
 
 /* ---------------- 大厅操作 ---------------- */
 
@@ -115,6 +154,7 @@ async function createRoom() {
     const data = await api('/api/room/create', {
       name: $('room-name').value.trim(),
       mode: $('room-mode').value,
+      difficulty: parseInt($('room-difficulty').value || '0', 10),
       player_name: name
     });
     if (!data.ok) throw new Error(data.error || '创建失败');
@@ -266,11 +306,13 @@ async function startGame(fillAI) {
 /* ---------------- 游戏操作 ---------------- */
 
 async function speak() {
-const btn = $('speak-btn');
+  const btn = $('speak-btn');
   if (speaking) return;
+  const contentEl = $('speak-content');
+  const content = contentEl ? contentEl.value.trim() : '';
+  if (!content) { toast('请输入发言内容'); return; }
   speaking = true;
   if (btn) { btn.disabled = true; btn.textContent = '审核中...'; }
-  const contentEl = $('speak-content');
   const opEl = $('speak-operation');
   const keywordEl = $('speak-keyword');
   const targetEl = $('speak-target');
@@ -279,11 +321,9 @@ const btn = $('speak-btn');
   if (keywordEl) keywordEl.disabled = true;
   if (targetEl) targetEl.disabled = true;
   const op = $('speak-operation').value;
-  const content = $('speak-content').value.trim();
   const keyword = $('speak-keyword').value.trim();
   const targetId = parseInt($('speak-target').value || '0', 10);
 
-  if (!content) { toast('请输入发言内容'); return; }
   try {
     const data = await api('/api/game/speak', {
       room_id: Number(state.room_id),
@@ -311,6 +351,11 @@ const btn = $('speak-btn');
 
 async function declareDeath(targetId) {
   try {
+    const room = state.current;
+    const me = room && room.players ? room.players.find(p => p.is_me) : null;
+    if (me && targetId === me.id) {
+      if (!confirm('确定要自认死亡吗？')) return;
+    }
     const data = await api('/api/game/declare_death', {
       room_id: Number(state.room_id),
       token: state.token,
@@ -408,7 +453,16 @@ function bindControlListeners() {
   const keyword = $('speak-keyword');
   const target = $('speak-target');
   const killTarget = $('kill-target');
-  if (content) content.oninput = () => { pendingControls.content = content.value; };
+  if (content) {
+    content.oninput = () => { pendingControls.content = content.value; };
+    content.onkeydown = (e) => {
+      /* 按回车直接发言；Shift+回车或输入法选词回车时不触发。 */
+      if (e.key !== 'Enter') return;
+      if (e.shiftKey || e.isComposing || e.keyCode === 229) return;
+      e.preventDefault();
+      speak();
+    };
+  }
   if (op) op.onchange = () => { pendingControls.operation = op.value; };
   if (keyword) keyword.oninput = () => { pendingControls.keyword = keyword.value; };
   if (target) target.onchange = () => { pendingControls.target = target.value; };
@@ -445,6 +499,7 @@ function renderHeader(room) {
         <span>房间ID：${room.room_id}</span>
         <span class="status-badge">${statusNames[room.status] || room.status}</span>
         <span class="status-badge">${room.mode === 1 ? 'GM模式' : '自动判定'}</span>
+        <span class="status-badge">${room.difficulty ? '困难' : '普通'}</span>
         <span class="status-badge">第 ${room.round || 0} 轮</span>
         ${ownerText ? `<span class="status-badge">${escaped(ownerText)}</span>` : ''}
       </div>
@@ -521,10 +576,10 @@ function renderNarratives(room) {
     return;
   }
   $('narrative-list').innerHTML = room.narratives.map(n => `
-    <div class="narrative-item${n.roll_used ? (n.roll_success ? ' roll-success' : ' roll-fail') : ''}">
+    <div class="narrative-item${n.calamity ? ' calamity' : ''}${n.notice ? ' notice' : ''}${n.roll_used ? (n.roll_success ? ' roll-success' : ' roll-fail') : ''}">
       <div class="meta">第${n.round}轮 · ${escaped(n.player_name)} · ${escaped(n.operation)}</div>
       <div>${escaped(n.content)}</div>
-      ${n.roll_used ? `<div class="meta roll-meta">🎲 ${escaped(n.roll_note)}${n.roll_success ? '' : ' → 事件未发生'}</div>` : ''}
+      ${n.roll_used ? `<div class="meta roll-meta">🎲 ${escaped(n.roll_note)}</div>` : ''}
       ${n.limit_keyword ? `<div class="meta">限定词：${escaped(n.limit_keyword)}</div>` : ''}
     </div>
   `).join('');
@@ -610,6 +665,9 @@ if (!me.alive) {
           ${targetOptions}
         </select>
         <button onclick="declareDeath(parseInt($('kill-target').value || '0', 10))" ${isMyTurn ? '' : 'disabled'}>宣告目标死亡</button>
+      </div>
+      <div class="toolbar">
+        <button class="danger-btn" onclick="if(confirm('确定退出游戏吗？')) leaveRoom()">退出游戏</button>
       </div>
     </div>`;
 if (room.mode === 1 && me.id === room.owner_id) {

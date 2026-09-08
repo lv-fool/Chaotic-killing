@@ -40,6 +40,49 @@ main {
   margin-top: 16px;
 }
 
+.game-layout {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+#player-sidebar {
+  width: 220px;
+  flex-shrink: 0;
+  position: sticky;
+  top: 16px;
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+  background: #1e1e32;
+  border: 1px solid #3a3a55;
+  border-radius: 10px;
+  padding: 12px;
+}
+
+#player-sidebar h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  color: #ffd166;
+}
+
+#player-sidebar .player-card {
+  display: block;
+  margin: 6px 0;
+}
+
+.sidebar-actions {
+  margin-top: 12px;
+}
+
+.sidebar-actions .danger-btn {
+  width: 100%;
+}
+
+.game-main {
+  flex: 1;
+  min-width: 0;
+}
+
 .hidden {
   display: none;
 }
@@ -203,6 +246,18 @@ button.primary:hover {
 .narrative-item .meta {
   color: #8888c0;
   font-size: 12px;
+}
+
+.narrative-item.calamity {
+  border-left-color: #e53935;
+  background: #4a1f22;
+  color: #ffb3b3;
+}
+
+.narrative-item.notice {
+  border-left-color: #9c27b0;
+  background: #3a1f4a;
+  color: #e1b6ff;
 }
 
 .narrative-item.roll-success {

@@ -45,6 +45,7 @@ int main(int argc, char **argv)
     set_default_env("LUANSHA_AI_URL", "https://token.sensenova.cn/v1/chat/completions");
     set_default_env("LUANSHA_AI_MODEL", "sensenova-6.8-flash-lite");
 
+    debug_log_init();
     game_init();
     ai_init();   /* 读取 ./luansha_ai.conf（若存在），运行时/文件配置优先于环境变量 */
 

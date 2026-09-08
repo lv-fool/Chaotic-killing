@@ -10,6 +10,10 @@
 #define MAX_NARRATIVES 2048
 #define MAX_WARNINGS 256
 #define TOKEN_LEN 16
+#define MAX_SCENE_ITEMS 12
+#define SCENE_ITEM_NAME_LEN 32
+#define AI_HISTORY_MAX 10
+#define AI_HISTORY_MSG_LEN 600
 
 enum RoomMode { MODE_AUTO = 0, MODE_GM = 1 };
 enum RoomStatus { ROOM_WAITING = 0, ROOM_PLAYING = 1, ROOM_ENDED = 2 };
@@ -27,6 +31,11 @@ typedef struct Player {
     int hp;                 /* current hit points */
     int max_hp;             /* maximum hit points */
     int numeric_status;     /* 0=applied, 1=adjusted; only final result exposed */
+    int calamity;           /* 灾祸值：不合理发言增加，合理发言减少 */
+    int next_turn_penalty;  /* 下回合限制：0=无，1=无法攻击，2=无法移动，3=跳过下回合，4=随机行动 */
+    int rescue_streak;      /* 连续成功自救次数，用于惩罚连续秒解 */
+    char ai_history[AI_HISTORY_MAX][AI_HISTORY_MSG_LEN]; /* AI 独立对话历史 */
+    int ai_history_count;
 } Player;
 
 typedef struct Narrative {
@@ -39,6 +48,8 @@ typedef struct Narrative {
     char limit_keyword[64];
     int target_id;
     int damage;         /* 0 = no damage, 1-3 = damage dealt */
+    int calamity;       /* 1 = 灾祸降临事件（前端标红展示），0 = 普通叙事 */
+    int notice;         /* 1 = 系统提示（前端标紫展示），0 = 普通叙事 */
     int roll_used;      /* 1 if a random check was performed */
     int roll_value;     /* 1..100 dice result */
     int roll_chance;    /* success threshold after weights */
@@ -73,7 +84,11 @@ typedef struct Room {
     int id;
     char name[MAX_NAME];
     int mode;
+    int difficulty;         /* 0=普通（灾厄仅不合理增加），1=困难（灾厄每轮自动累积） */
     int status;
+    int scene_item_count;   /* 本局新出现的大型场景/物品计数，用于限制凭空刷物品 */
+    int scene_item_total;   /* 本局临时场景物品池数量 */
+    char scene_items[MAX_SCENE_ITEMS][SCENE_ITEM_NAME_LEN]; /* 开局根据场景自动生成 */
     Player players[MAX_PLAYERS];
     int player_count;
     int order[MAX_PLAYERS];
@@ -88,6 +103,7 @@ typedef struct Room {
     LimitState limit;
     int winner_id;
     int owner_id;
+    char judge_log[4096];   /* 对局审核独立对话所需的全场记录 */
 } Room;
 
 /* Global game state. */
@@ -95,8 +111,11 @@ extern Room g_rooms[MAX_ROOMS];
 extern int g_room_count;
 extern int g_next_room_id;
 
+/* Debug log */
+void debug_log_init(void);
+
 /* Room lifecycle */
-int game_create_room(const char *room_name, int mode, const char *player_name, char *token_out);
+int game_create_room(const char *room_name, int mode, int difficulty, const char *player_name, char *token_out);
 int game_join_room(int room_id, const char *player_name, char *token_out);
 int game_add_ai(int room_id);
 int game_set_ready(int room_id, const char *token, int ready);

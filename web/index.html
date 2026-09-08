@@ -27,6 +27,10 @@
           <option value="auto">系统自动判定</option>
           <option value="gm">GM 裁决模式</option>
         </select>
+        <select id="room-difficulty">
+          <option value="0">普通</option>
+          <option value="1">困难</option>
+        </select>
         <button onclick="createRoom()">创建</button>
       </div>
       <div class="form-row">
@@ -38,17 +42,30 @@
       <div class="form-row">
         <button onclick="openAIConfig()">🧪 测试 AI 接口</button>
         <span id="ai-test-result" class="hint"></span>
-      </div>
-    </section>
+        <div class="form-row">
+          <button onclick="startPublicTunnel()">🌐 开启公网联机</button>
+          <span id="public-tunnel-result" class="hint"></span>
+        <button class="danger-btn" onclick="quitGame()">退出游戏</button>
+        </div></section>
 
     <!-- 游戏视图 -->
     <section id="game-view" class="panel hidden">
-      <div id="room-header"></div>
-      <div id="player-list"></div>
-      <div id="limit-banner"></div>
-      <div id="narrative-list"></div>
-      <div id="warning-list"></div>
-      <div id="game-actions"></div>
+      <div class="game-layout">
+        <aside id="player-sidebar">
+          <h3>玩家状态</h3>
+          <div id="player-list"></div>
+          <div class="sidebar-actions">
+            <button class="danger-btn" onclick="if(confirm('确定退出游戏吗？')) leaveRoom()">退出游戏</button>
+          </div>
+        </aside>
+        <div class="game-main">
+          <div id="room-header"></div>
+          <div id="limit-banner"></div>
+          <div id="narrative-list"></div>
+          <div id="warning-list"></div>
+          <div id="game-actions"></div>
+        </div>
+      </div>
     </section>
   </main>
 

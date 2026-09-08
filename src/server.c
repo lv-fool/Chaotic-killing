@@ -431,6 +431,7 @@ static void handle_api(socket_t client, HttpRequest *req)
         JsonValue *v = json_parse(req->body);
         const char *name, *player_name, *mode_str;
         int mode = MODE_AUTO;
+        int difficulty = 0;
         char token[TOKEN_LEN + 1] = {0};
         int room_id;
         JsonBuf res;
@@ -439,7 +440,8 @@ static void handle_api(socket_t client, HttpRequest *req)
         player_name = json_get_string(v, "player_name", "");
         mode_str = json_get_string(v, "mode", "auto");
         if (strcmp(mode_str, "gm") == 0) mode = MODE_GM;
-        room_id = game_create_room(name, mode, player_name, token);
+        difficulty = json_get_int(v, "difficulty", 0);
+        room_id = game_create_room(name, mode, difficulty, player_name, token);
         json_free(v);
         if (room_id < 0) { send_error_json(client, "Create failed"); return; }
         jsonb_init(&res);

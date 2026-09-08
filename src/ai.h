@@ -153,4 +153,43 @@ int ai_try_generate_rescue(
     int *rescued_out,
     char *reason_out, size_t reason_size);
 
+/*
+ * 独立对局审核：把整场对局记录交给审核AI，返回审核结论。
+ */
+int ai_review_game(
+    const char *room_name,
+    const char *players_text,
+    const char *judge_log,
+    char *out, size_t out_size);
+
+/*
+ * 逐句审核：对当前发言进行独立审核，返回是否违规。
+ */
+int ai_review_sentence(
+    const char *room_name,
+    const char *players_text,
+    const char *judge_log,
+    const char *current_line,
+    char *out, size_t out_size);
+
+/*
+ * 合并的玩家发言判定：一次调用同时完成合理性/单一谓语/模式校验和随机判定判断。
+ */
+int ai_judge_player_narration(
+    const char *room_name,
+    const char *players_text,
+    const char *narrator,
+    const char *content,
+    int operation,
+    int is_first_sentence,
+    const char *recent_text,
+    int *valid_reason,
+    int *valid_predicate,
+    int *valid_mode,
+    int *need_roll,
+    int *difficulty,
+    int *plausibility,
+    int *preparation,
+    char *reason, size_t reason_size);
+
 #endif /* AI_H */

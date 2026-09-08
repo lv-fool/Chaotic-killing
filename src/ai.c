@@ -1,4 +1,5 @@
 #include "ai.h"
+#include <stdarg.h>
 #include "json.h"
 
 #include <stdio.h>
@@ -10,6 +11,7 @@
 #ifdef _WIN32
   #include <winsock2.h>
   #include <ws2tcpip.h>
+  #include <windows.h>
   #ifdef _MSC_VER
     #pragma comment(lib, "ws2_32.lib")
   #endif
@@ -106,6 +108,21 @@ static void ai_throttle_mark(const char *response)
     }
 }
 
+
+static void ai_debug_log(const char *fmt, ...)
+{
+    const char *path = getenv("LUANSHA_DEBUG_LOG");
+    FILE *f;
+    va_list ap;
+    if (!path || !*path) path = "debug_operations.log";
+    f = fopen(path, "a");
+    if (!f) return;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
 
 static void ai_trim_crlf(char *str)
 {
@@ -669,25 +686,43 @@ static int ai_complete_text(const char *system_prompt, const char *user_prompt,
 
     {
         int got_response = 0;
-        for (attempt = 0; attempt < 1; attempt++) {
+        const char *fail_reason = "unknown";
+        for (attempt = 0; attempt < 2; attempt++) {
+            int r;
             if (strncmp(ai_url, "https://", 8) == 0) {
-                if (https_post_json_via_curl(ai_url, request_body, response, sizeof(response)) == 0) {
-                    got_response = 1;
-                } else if (debug && *debug) {
-                    fprintf(stderr, "[AI] HTTPS generation failed (attempt %d)\n", attempt + 1);
-                }
+                r = https_post_json_via_curl(ai_url, request_body, response, sizeof(response));
             } else {
-                if (http_post_json(ai_url, request_body, response, sizeof(response)) == 0) {
-                    got_response = 1;
-                } else if (debug && *debug) {
-                    fprintf(stderr, "[AI] HTTP generation failed (attempt %d)\n", attempt + 1);
-                }
+                r = http_post_json(ai_url, request_body, response, sizeof(response));
             }
+            if (r == 0) {
+                got_response = 1;
+            } else if (r == -2) {
+                fail_reason = "throttled";
+            } else {
+                fail_reason = "network";
+            }
+            if (debug && *debug) fprintf(stderr, "[AI] generation failed (attempt %d) reason=%s\n", attempt + 1, fail_reason);
             if (got_response) break;
+            /* 网络波动短暂重试一次；节流失败不重试。 */
+            if (attempt == 0 && fail_reason[0] == 'n') {
+#ifdef _WIN32
+                Sleep(1000);
+#else
+                sleep(1);
+#endif
+            } else {
+                break;
+            }
         }
-        if (!got_response) return 0;
+        if (!got_response) {
+            ai_debug_log("[ai_request] fail reason=%s url=%s", fail_reason, ai_url);
+            return 0;
+        }
     }
-    if (!*response) return 0;
+    if (!*response) {
+        ai_debug_log("[ai_request] fail reason=empty_response url=%s", ai_url);
+        return 0;
+    }
 
     root = json_parse(response);
     if (!root) {
@@ -726,9 +761,11 @@ static int ai_complete_text(const char *system_prompt, const char *user_prompt,
         memcpy(out, text, len);
         out[len] = '\0';
         json_free(root);
+        ai_debug_log("[ai_request] success url=%s", ai_url);
         return 1;
     }
     json_free(root);
+    ai_debug_log("[ai_request] fail parse url=%s", ai_url);
     return 0;
 }
 int ai_test_connection(char *out, size_t out_size)
@@ -1165,6 +1202,8 @@ int ai_try_generate_narration(
         "必须给出具体动作，禁止只说“我向X发起攻击”这种笼统描述；"
         "必须基于当前房间/场景中的真实物体和物理规则，禁止时间倒流、黑洞、"
         "撕下影子/骨骼、数据化、超能力等脱离场景的设定；"
+        "不得突然切换到前文未出现过的新场景/新房间；"
+        "只能延续当前场景与最近发言中出现过的地点、物品和设施；"
         "不得复制或高度模仿其他玩家或自己之前的发言；"
         "不要输出解释、不要加引号、不要输出JSON。",
         ai_name ? ai_name : "");
@@ -1272,6 +1311,8 @@ int ai_try_generate_attack(
         "必须给出具体动作，禁止只说“我向X发起攻击”这种笼统描述；"
         "必须基于当前房间/场景中的真实物体和物理规则，禁止时间倒流、黑洞、"
         "撕下影子/骨骼、数据化、超能力等脱离场景的设定；"
+        "不得突然切换到前文未出现过的新场景/新房间；"
+        "只能延续当前场景与最近发言中出现过的地点、物品和设施；"
         "不得复制或高度模仿其他玩家或自己之前的发言；"
         "只输出JSON，不要输出其他文字，格式："
         "{\"target\":\"目标玩家名\",\"content\":\"你的一句话行动\",\"danger\":true或false,\"damage\":1到3,\"reason\":\"简短原因\"}"
@@ -1411,4 +1452,180 @@ int ai_try_generate_rescue(
     }
     json_free(v);
     return ok ? 1 : 0;
+}
+
+int ai_review_game(
+    const char *room_name,
+    const char *players_text,
+    const char *judge_log,
+    char *out, size_t out_size)
+{
+    char system_prompt[1024];
+    char user_prompt[2200];
+    const char *debug = getenv("LUANSHA_AI_DEBUG");
+
+    if (!out || out_size == 0) return 0;
+    out[0] = '\0';
+
+    snprintf(system_prompt, sizeof(system_prompt),
+        "你是《乱杀法则》对局审核AI，你拥有最终审核权限。"
+        "请根据整场对局记录，判断是否存在违规，并给出审核结论。"
+        "只输出JSON，不要输出其他文字，格式："
+        "{\"violation\":true或false,\"summary\":\"中文总结\",\"winner_ok\":true或false}");
+
+    snprintf(user_prompt, sizeof(user_prompt),
+        "房间名：%s\n在线玩家：%s\n对局记录：%.2000s",
+        room_name ? room_name : "未知",
+        players_text ? players_text : "无",
+        judge_log && *judge_log ? judge_log : "暂无记录");
+
+    if (ai_complete_text(system_prompt, user_prompt, out, out_size) != 1) {
+        /* 等待节流窗口后重试一次，避免全局审核被普通限流拦截。 */
+        ai_debug_log("[review_game] fail first_try, waiting for retry");
+#ifdef _WIN32
+        Sleep(8000);
+#else
+        sleep(8);
+#endif
+        if (ai_complete_text(system_prompt, user_prompt, out, out_size) != 1) {
+            ai_debug_log("[review_game] fail retry");
+            if (debug && *debug) fprintf(stderr, "[AI] review_game failed after retry\n");
+            return 0;
+        }
+    }
+    ai_debug_log("[review_game] ok result=%s", out);
+    if (debug && *debug) fprintf(stderr, "[AI] review_game ok: %s\n", out);
+    return 1;
+}
+
+int ai_review_sentence(
+    const char *room_name,
+    const char *players_text,
+    const char *judge_log,
+    const char *current_line,
+    char *out, size_t out_size)
+{
+    char system_prompt[1024];
+    char user_prompt[2400];
+    const char *debug = getenv("LUANSHA_AI_DEBUG");
+
+    if (!out || out_size == 0) return 0;
+    out[0] = '\0';
+
+    snprintf(system_prompt, sizeof(system_prompt),
+        "你是《乱杀法则》逐句审核AI，你拥有对该句发言的审核权限。"
+        "请根据之前的对局记录，判断当前这句话是否违规。"
+        "只输出JSON，不要输出其他文字，格式："
+        "{\"violation\":true或false,\"reason\":\"中文原因\",\"suggestion\":\"中文建议\"}");
+
+    snprintf(user_prompt, sizeof(user_prompt),
+        "房间名：%s\n在线玩家：%s\n之前的对局记录：%.1500s\n当前发言：%s",
+        room_name ? room_name : "未知",
+        players_text ? players_text : "无",
+        judge_log && *judge_log ? judge_log : "暂无",
+        current_line ? current_line : "");
+
+    if (ai_complete_text(system_prompt, user_prompt, out, out_size) != 1) {
+        ai_debug_log("[review_sentence] fail");
+        if (debug && *debug) fprintf(stderr, "[AI] review_sentence failed\n");
+        return 0;
+    }
+    ai_debug_log("[review_sentence] ok result=%s", out);
+    if (debug && *debug) fprintf(stderr, "[AI] review_sentence ok: %s\n", out);
+    return 1;
+}
+
+int ai_judge_player_narration(
+    const char *room_name,
+    const char *players_text,
+    const char *narrator,
+    const char *content,
+    int operation,
+    int is_first_sentence,
+    const char *recent_text,
+    int *valid_reason,
+    int *valid_predicate,
+    int *valid_mode,
+    int *need_roll,
+    int *difficulty,
+    int *plausibility,
+    int *preparation,
+    char *reason, size_t reason_size)
+{
+    const char *debug = getenv("LUANSHA_AI_DEBUG");
+    (void)is_first_sentence;
+    char system_prompt[1400];
+    char user_prompt[2200];
+    char out[1024];
+    JsonValue *v = NULL;
+    const char *op_name = "普通陈述";
+    const char *r;
+
+    if (!valid_reason || !valid_predicate || !valid_mode ||
+        !need_roll || !difficulty || !plausibility || !preparation) return 0;
+    *valid_reason = 1;
+    *valid_predicate = 1;
+    *valid_mode = 1;
+    *need_roll = 0;
+    *difficulty = 3;
+    *plausibility = 3;
+    *preparation = 3;
+    if (reason && reason_size > 0) reason[0] = '\0';
+
+    if (operation == 1) op_name = "创造";
+    else if (operation == 2) op_name = "扭曲";
+    else if (operation == 3) op_name = "解释/补充";
+    else if (operation == 4) op_name = "限定";
+
+    snprintf(system_prompt, sizeof(system_prompt),
+        "你是《乱杀法则》跑团游戏的裁判。请一次性判断玩家这句话："
+        "1) 合理性 valid_reason：叙述符合作家原则，所有事物有原因，不能凭空无敌或明显不合理；"
+        "2) 单一谓语 valid_predicate：每轮每人只能说一个谓语/行为核心，不能使用连词，不能多个动作并列；"
+        "3) 模式匹配 valid_mode：获得物品/创造新事物应选“创造”；改变已有事件/攻击应选“扭曲”；"
+        "普通叙述/观察应选“陈述”；补全解释应选“解释/补充”；设定关键词转折应选“限定”；"
+        "4) 是否需要随机判定 need_roll：必然成功的日常动作（走路、观察、说话、拿起身边物品）不需要；"
+        "结果不确定、依赖运气或对抗的动作（偷袭、命中、逃脱、说服、临时制造复杂物品、破坏结构）需要；"
+        "5) difficulty=1非常容易 5近乎不可能；plausibility=1非常牵强 5非常合理；preparation=1完全没有铺垫 5前文已充分铺垫。"
+        "如果这是本局第一句话，理论上玩家出生在家里，第一句应类似“我走出了家门”。"
+        "只输出JSON，不要输出其他文字，格式："
+        "{\"valid_reason\":true或false,\"valid_predicate\":true或false,\"valid_mode\":true或false,"
+        "\"reason\":\"中文原因\",\"need_roll\":true或false,\"difficulty\":1-5,"
+        "\"plausibility\":1-5,\"preparation\":1-5}");
+
+    snprintf(user_prompt, sizeof(user_prompt),
+        "房间名：%s\n在线玩家：%s\n发言玩家：%s\n操作类型：%s\n最近发言：%s\n发言内容：%s",
+        room_name ? room_name : "未知",
+        players_text ? players_text : "无",
+        narrator ? narrator : "未知",
+        op_name,
+        recent_text && *recent_text ? recent_text : "无",
+        content ? content : "");
+
+    if (ai_complete_text(system_prompt, user_prompt, out, sizeof(out)) != 1) {
+        if (debug && *debug) fprintf(stderr, "[AI] judge_player_narration failed\n");
+        return 0;
+    }
+
+    v = json_parse(out);
+    if (!v) return 0;
+
+    r = json_get_string(v, "valid_reason", "");
+    if (r && *r) *valid_reason = strcmp(r, "true") == 0;
+    r = json_get_string(v, "valid_predicate", "");
+    if (r && *r) *valid_predicate = strcmp(r, "true") == 0;
+    r = json_get_string(v, "valid_mode", "");
+    if (r && *r) *valid_mode = strcmp(r, "true") == 0;
+    r = json_get_string(v, "reason", "");
+    if (r && *r && reason && reason_size > 0) snprintf(reason, reason_size, "%s", r);
+    r = json_get_string(v, "need_roll", "");
+    if (r && *r) *need_roll = strcmp(r, "true") == 0;
+    r = json_get_string(v, "difficulty", "");
+    if (r && *r) *difficulty = atoi(r);
+    r = json_get_string(v, "plausibility", "");
+    if (r && *r) *plausibility = atoi(r);
+    r = json_get_string(v, "preparation", "");
+    if (r && *r) *preparation = atoi(r);
+
+    json_free(v);
+    return 1;
 }

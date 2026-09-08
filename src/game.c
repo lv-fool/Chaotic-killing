@@ -5,8 +5,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdarg.h>
 
 #define DEFAULT_MAX_HP 6
+
+/* 灾祸值机制：不合理发言累积灾祸，达到阈值后每步有概率触发灾祸并清零。 */
+#define CALAMITY_THRESHOLD 5
+#define CALAMITY_CHANCE_LOW   20   /* 灾祸值 5-9 */
+#define CALAMITY_CHANCE_MED   40   /* 灾祸值 10-14 */
+#define CALAMITY_CHANCE_HIGH  60   /* 灾祸值 >=15 */
 
 Room g_rooms[MAX_ROOMS];
 int g_room_count = 0;
@@ -17,6 +24,32 @@ static void safe_copy(char *dst, size_t size, const char *src)
     if (!dst || size == 0) return;
     if (!src) { dst[0] = '\0'; return; }
     snprintf(dst, size, "%s", src);
+}
+
+/* Debug 模式：默认记录到 debug_operations.log，可用 LUANSHA_DEBUG_LOG 覆盖路径。 */
+static void debug_log(const char *fmt, ...)
+{
+    const char *path = getenv("LUANSHA_DEBUG_LOG");
+    FILE *f;
+    va_list ap;
+    if (!path || !*path) path = "debug_operations.log";
+    f = fopen(path, "a");
+    if (!f) return;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
+/* 启动时清空旧日志，避免多次运行内容合并。 */
+void debug_log_init(void)
+{
+    const char *path = getenv("LUANSHA_DEBUG_LOG");
+    FILE *f;
+    if (!path || !*path) path = "debug_operations.log";
+    f = fopen(path, "w");
+    if (f) fclose(f);
 }
 
 /* ------------------------------------------------------------------ */
@@ -116,6 +149,207 @@ static NumericReason numeric_reason_for_heal(int current_hp, int max_hp)
     return NUMERIC_REASON_LOW;
 }
 
+/* 灾祸值：根据发言合理度增减。 */
+static int player_has_unresolved_warning(Room *room, int player_id);
+static void apply_damage(Room *room, int target_id, int damage, int source_id);
+static NumericReason sentence_reasonableness(const char *content, int operation)
+{
+    static const char *bad_words[] = {
+        "时间倒流", "黑洞", "影子", "数据化", "量子", "奇点",
+        "克莱因", "莫比乌斯", "撕下自己的", "抽出来", "等离子体",
+        "纳米", "信息态", "云端", "超能力"
+    };
+    size_t i;
+
+    if (!content) return NUMERIC_REASON_LOW;
+    for (i = 0; i < sizeof(bad_words) / sizeof(bad_words[0]); i++) {
+        if (strstr(content, bad_words[i])) return NUMERIC_REASON_LOW;
+    }
+    if ((operation == OP_NORMAL || operation == OP_EXPLAIN) &&
+        strstr(content, "我向") && strstr(content, "发起攻击")) {
+        return NUMERIC_REASON_LOW;
+    }
+    if ((operation == OP_CREATE || operation == OP_TWIST) &&
+        strstr(content, "保持沉默")) {
+        return NUMERIC_REASON_LOW;
+    }
+    if (operation == OP_TWIST || operation == OP_CREATE) return NUMERIC_REASON_HIGH;
+    return NUMERIC_REASON_MEDIUM;
+}
+
+static void adjust_calamity(Player *p, NumericReason reason)
+{
+    if (!p) return;
+    if (reason == NUMERIC_REASON_HIGH) {
+        /* 合理发言不会降低灾祸值，只是不再增加。 */
+    } else if (reason == NUMERIC_REASON_MEDIUM) {
+        p->calamity += 1;
+    } else {
+        p->calamity += 3;
+    }
+    if (p->calamity < 0) p->calamity = 0;
+}
+
+static int calamity_trigger_chance(int calamity)
+{
+    if (calamity >= 15) return CALAMITY_CHANCE_HIGH;
+    if (calamity >= 10) return CALAMITY_CHANCE_MED;
+    return CALAMITY_CHANCE_LOW;
+}
+
+static void add_notice_narrative(Room *room, int player_id, const char *text)
+{
+    Narrative *n;
+    if (!room || room->narrative_count >= MAX_NARRATIVES || !text) return;
+    n = &room->narratives[room->narrative_count];
+    memset(n, 0, sizeof(*n));
+    n->id = room->narrative_count + 1;
+    n->room_id = room->id;
+    n->player_id = player_id;
+    n->round = room->round;
+    n->operation = OP_NORMAL;
+    snprintf(n->content, sizeof(n->content), "%s", text);
+    n->target_id = player_id;
+    n->notice = 1;
+    room->narrative_count++;
+}
+
+static void try_trigger_calamity(Room *room, Player *p)
+{
+    static const char *damage_lines[] = {
+        "你脚下的地面忽然塌陷，碎石擦过你的小腿。",
+        "不知何处飞来的碎屑击中你的肩膀。",
+        "头顶的吊灯猛然坠落，你堪堪避开却仍被碎片划伤。",
+        "一阵狂风卷起沙石，狠狠打在你的背脊上。"
+    };
+    static const char *wound_lines[] = {
+        "你感到一阵锐痛从胸口传来，呼吸变得困难。",
+        "一股无形的压力笼罩着你，你几乎无法站稳。",
+        "你的视野突然发黑，仿佛有什么东西正在侵蚀你的意识。",
+        "你听见自己的心跳越来越重，身体却逐渐不听使唤。"
+    };
+    int chance;
+    int type;
+    int damage = 0;
+    const char *text;
+    const char *notice_text = NULL;
+    Narrative *n;
+
+    if (!room || !p || !p->alive) return;
+    if (p->calamity < CALAMITY_THRESHOLD) return;
+
+    chance = calamity_trigger_chance(p->calamity);
+    if (rand() % 100 >= chance) return;
+    if (room->narrative_count >= MAX_NARRATIVES) return;
+
+    /* 灾厄类型随机：0=伤害，1=下回合限制 */
+    type = rand() % 2;
+    if (type == 0) {
+        int idx = rand() % (sizeof(damage_lines) / sizeof(damage_lines[0]));
+        static const int fixed_damage[] = { 1, 1, 2, 2 };
+        damage = fixed_damage[idx];
+        text = damage_lines[idx];
+    } else {
+        int idx = rand() % (sizeof(wound_lines) / sizeof(wound_lines[0]));
+        static const int penalties[] = { 1, 2, 3, 4 };
+        static const char *notices[] = {
+            "下回合无法攻击。",
+            "下回合无法移动。",
+            "下回合将被跳过。",
+            "下回合将随机行动。"
+        };
+        p->next_turn_penalty = penalties[idx];
+        text = wound_lines[idx];
+        notice_text = notices[idx];
+    }
+
+    /* 先记录红色灾厄事件，归属系统。 */
+    n = &room->narratives[room->narrative_count];
+    memset(n, 0, sizeof(*n));
+    n->id = room->narrative_count + 1;
+    n->room_id = room->id;
+    n->player_id = 0;
+    n->round = room->round;
+    n->operation = OP_TWIST;
+    snprintf(n->content, sizeof(n->content), "%s", text);
+    n->target_id = p->id;
+    n->damage = damage;
+    n->calamity = 1;
+    room->narrative_count++;
+
+    /* 限制型再追加紫色系统提示，归属系统。 */
+    if (type == 1 && notice_text) {
+        add_notice_narrative(room, 0, notice_text);
+    }
+
+    p->calamity = 0;
+
+    debug_log("[calamity] room=%d player=%s type=%s penalty=%d damage=%d",
+              room->id, p->name, type == 0 ? "damage" : "penalty",
+              p->next_turn_penalty, damage);
+
+    if (type == 0) {
+        apply_damage(room, p->id, damage, 0);
+    }
+    /* type == 1 时只设置 next_turn_penalty，不额外施加濒死警告。 */
+}
+
+/* 开局根据房间名/场景自动生成临时场景物品池（保留用于后续“道具赛”方向）。 */
+static void init_scene_items(Room *room)
+{
+    static const char *bar_items[] = {
+        "吧台", "酒架", "威士忌", "酒杯", "吧椅", "冰桶", "酒瓶", "调酒器"
+    };
+    static const char *warehouse_items[] = {
+        "货架", "木箱", "工具箱", "铁管", "叉车", "配电箱", "消防栓", "扳手"
+    };
+    static const char *hospital_items[] = {
+        "病床", "手术刀", "药柜", "输液架", "轮椅", "消毒水", "绷带", "手术台"
+    };
+    static const char *school_items[] = {
+        "课桌", "黑板", "讲台", "椅子", "书本", "灭火器", "窗户", "走廊"
+    };
+    static const char *shop_items[] = {
+        "货架", "购物车", "冰柜", "收银台", "罐头", "玻璃瓶", "手推车", "货箱"
+    };
+    static const char *street_items[] = {
+        "消防栓", "皮卡", "加油站", "工具箱", "铁管", "垃圾桶", "井盖", "广告牌"
+    };
+    const char **pool = street_items;
+    int pool_size = (int)(sizeof(street_items) / sizeof(street_items[0]));
+    int i;
+
+    if (!room) return;
+    room->scene_item_total = 0;
+
+    if (strstr(room->name, "酒吧") || strstr(room->name, "酒馆") ||
+        strstr(room->name, "夜店") || strstr(room->name, "餐厅")) {
+        pool = bar_items;
+        pool_size = (int)(sizeof(bar_items) / sizeof(bar_items[0]));
+    } else if (strstr(room->name, "仓库") || strstr(room->name, "厂房") ||
+               strstr(room->name, "车间") || strstr(room->name, "工厂")) {
+        pool = warehouse_items;
+        pool_size = (int)(sizeof(warehouse_items) / sizeof(warehouse_items[0]));
+    } else if (strstr(room->name, "医院") || strstr(room->name, "诊所") ||
+               strstr(room->name, "急救")) {
+        pool = hospital_items;
+        pool_size = (int)(sizeof(hospital_items) / sizeof(hospital_items[0]));
+    } else if (strstr(room->name, "学校") || strstr(room->name, "教室") ||
+               strstr(room->name, "学院")) {
+        pool = school_items;
+        pool_size = (int)(sizeof(school_items) / sizeof(school_items[0]));
+    } else if (strstr(room->name, "超市") || strstr(room->name, "便利店") ||
+               strstr(room->name, "商店") || strstr(room->name, "商场")) {
+        pool = shop_items;
+        pool_size = (int)(sizeof(shop_items) / sizeof(shop_items[0]));
+    }
+
+    for (i = 0; i < pool_size && i < MAX_SCENE_ITEMS; i++) {
+        snprintf(room->scene_items[i], SCENE_ITEM_NAME_LEN, "%s", pool[i]);
+        room->scene_item_total++;
+    }
+}
+
 static int starts_with(const char *s, const char *prefix)
 {
     if (!s || !prefix || !*prefix) return 0;
@@ -161,6 +395,49 @@ static int count_terminal_punct(const char *s)
     return n;
 }
 
+/* AI 生成内容语法/合理性快速审查：明显不合格则回退。 */
+static int is_ai_content_bad(const char *s, char *reason, size_t reason_size)
+{
+    size_t len;
+    const unsigned char *p;
+    if (reason && reason_size > 0) reason[0] = '\0';
+    if (!s) {
+        if (reason) snprintf(reason, reason_size, "内容为空");
+        return 1;
+    }
+    len = strlen(s);
+    if (len < 4) {
+        if (reason) snprintf(reason, reason_size, "内容太短");
+        return 1;
+    }
+    if (len > 300) {
+        if (reason) snprintf(reason, reason_size, "内容太长，请压缩成一句话");
+        return 1;
+    }
+
+    p = (const unsigned char *)s + len - 1;
+    while (p > (const unsigned char *)s &&
+           (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) {
+        p--;
+    }
+    if (*p == ',' || *p == ';') {
+        if (reason) snprintf(reason, reason_size, "句子不完整，不能以逗号或分号结尾");
+        return 1;
+    }
+
+    /* 模糊/模板化攻击句 */
+    if (strstr(s, "我向") && (strstr(s, "发起攻击") || strstr(s, "发起了攻击"))) {
+        if (reason) snprintf(reason, reason_size, "使用了模糊的模板化攻击描述，请写出具体动作");
+        return 1;
+    }
+    if (strstr(s, "手边最近的硬物")) {
+        if (reason) snprintf(reason, reason_size, "使用了模糊的模板化攻击描述，请写出具体动作");
+        return 1;
+    }
+
+    return 0;
+}
+
 static int contains_conjunction(const char *s)
 {
     static const char *words[] = {
@@ -183,6 +460,20 @@ static int contains_kill_marker(const char *s)
         "炸死", "致命", "重伤", "濒死", "处决", "消灭"
     };
     size_t i;
+    for (i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+        if (strstr(s, words[i])) return 1;
+    }
+    return 0;
+}
+
+static int contains_move_marker(const char *s)
+{
+    static const char *words[] = {
+        "移动", "冲", "跑", "跳", "滚", "退", "进", "靠近", "离开",
+        "走向", "扑向", "奔", "逃", "躲", "闪", "翻身", "侧身"
+    };
+    size_t i;
+    if (!s) return 0;
     for (i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
         if (strstr(s, words[i])) return 1;
     }
@@ -239,7 +530,7 @@ static int heuristic_damage(const char *s, int operation)
 /*   + luck compensation (previous failure)                            */
 /* clamped to [ROLL_MIN, ROLL_MAX]; d100 <= chance means success.      */
 /* ------------------------------------------------------------------ */
-#define ROLL_BASE        50
+#define ROLL_BASE        75
 #define ROLL_W_DIFF      12
 #define ROLL_W_PLAUSIBLE  8
 #define ROLL_W_PREPARED   6
@@ -298,6 +589,9 @@ static void resolve_victim_warnings(Room *room, int victim_id)
     for (i = 0; i < room->warning_count; i++) {
         if (room->warnings[i].victim_id == victim_id && !room->warnings[i].resolved) {
             room->warnings[i].resolved = 1;
+            debug_log("[warning_resolve] room=%d victim=%d source=%d reason=%s",
+                      room->id, victim_id, room->warnings[i].source_id,
+                      room->warnings[i].reason);
         }
     }
 }
@@ -364,6 +658,14 @@ static int process_one_pending_ai_action(Room *room)
         return 1;
     }
     if (room->players[room->order[room->turn_index]].is_ai) {
+        Player *ap = &room->players[room->order[room->turn_index]];
+        /* 下回合限制：跳过回合。 */
+        if (ap->next_turn_penalty == 3) {
+            ap->next_turn_penalty = 0;
+            debug_log("[penalty] room=%d player=%s penalty=3 action=skip_turn", room->id, ap->name);
+            advance_to_next_alive(room);
+            return 1;
+        }
         /* AI 先判断能否宣告自己造成的未解除濒死警告为目标死亡。 */
         if (ai_try_declare_death(room)) {
             return 1;
@@ -378,6 +680,44 @@ static int process_one_pending_ai_action(Room *room)
         return 1;
     }
     return 0;
+}
+
+static void judge_log_append(Room *room, const char *line)
+{
+    size_t used;
+    size_t len;
+    if (!room || !line) return;
+    used = strlen(room->judge_log);
+    len = strlen(line);
+    if (used + len + 2 >= sizeof(room->judge_log)) return;
+    strncat(room->judge_log, line, sizeof(room->judge_log) - used - 1);
+    strncat(room->judge_log, "\n", sizeof(room->judge_log) - strlen(room->judge_log) - 1);
+}
+
+static void ai_history_push(Player *p, const char *msg)
+{
+    int i;
+    if (!p || !msg || !*msg) return;
+    if (p->ai_history_count >= AI_HISTORY_MAX) {
+        for (i = 1; i < AI_HISTORY_MAX; i++) {
+            safe_copy(p->ai_history[i - 1], AI_HISTORY_MSG_LEN, p->ai_history[i]);
+        }
+        p->ai_history_count = AI_HISTORY_MAX - 1;
+    }
+    safe_copy(p->ai_history[p->ai_history_count], AI_HISTORY_MSG_LEN, msg);
+    p->ai_history_count++;
+}
+
+static void ai_history_append_to_recent(Player *p, char *recent_text, size_t recent_size)
+{
+    int i;
+    if (!p || !recent_text || recent_size == 0) return;
+    for (i = 0; i < p->ai_history_count; i++) {
+        size_t used = strlen(recent_text);
+        if (used + strlen(p->ai_history[i]) + 2 >= recent_size) break;
+        strncat(recent_text, p->ai_history[i], recent_size - used - 1);
+        strncat(recent_text, "\n", recent_size - strlen(recent_text) - 1);
+    }
 }
 
 static void ai_speak_current(Room *room)
@@ -420,6 +760,7 @@ static void ai_speak_current(Room *room)
     int attack_danger = 0;
     int attack_damage = 0;
     char attack_reason[256] = "";
+    int gen_retry = 0;
     int rescue_used = 0;
     int rescue_success = 0;
     char rescue_reason[256] = "";
@@ -430,6 +771,10 @@ static void ai_speak_current(Room *room)
     p = &room->players[room->order[room->turn_index]];
     if (!p->is_ai) return;
     if (room->narrative_count >= MAX_NARRATIVES) return;
+
+    if (p->next_turn_penalty == 4) {
+        debug_log("[penalty] room=%d player=%s penalty=4 action=random_ai", room->id, p->name);
+    }
 
     for (i = 0; i < room->player_count; i++) {
         if (i) strncat(players_text, ", ", sizeof(players_text) - strlen(players_text) - 1);
@@ -446,6 +791,9 @@ static void ai_speak_current(Room *room)
         snprintf(line, sizeof(line), "%s：%s\n", np->name, room->narratives[i].content);
         strncat(recent_text, line, sizeof(recent_text) - strlen(recent_text) - 1);
     }
+
+    /* 加入该 AI 自己的独立历史，使其能记住自己之前的行动。 */
+    ai_history_append_to_recent(p, recent_text, sizeof(recent_text));
 
     if (player_has_unresolved_warning(room, p->id)) {
         snprintf(constraint, sizeof(constraint), "你正处于濒死状态，请描述如何化解危机。");
@@ -478,6 +826,13 @@ if (!p->has_spoken_first) {
         } else {
             op = OP_NORMAL;
         }
+    }
+
+    /* 下回合限制：无法攻击时禁止进攻。 */
+    if (p->next_turn_penalty == 1 && attack_mode) {
+        attack_mode = 0;
+        op = OP_NORMAL;
+        debug_log("[penalty] room=%d player=%s penalty=1 action=no_attack", room->id, p->name);
     }
 
     /* 选择进攻目标：优先集火已有未解除濒死警告的玩家，其次随机存活玩家。 */
@@ -517,6 +872,9 @@ if (!p->has_spoken_first) {
         }
     }
 
+retry_generate:
+    content[0] = '\0';
+    content_ok = 0;
     if (ai_is_configured()) {
         if (attack_mode) {
             char atk_target[64] = "";
@@ -570,11 +928,51 @@ if (!p->has_spoken_first) {
         content_ok = 0;
         content[0] = '\0';
     }
+    /* 语法/合理性审查：不合格时重新生成，最多重试 2 次。 */
+    if (content_ok) {
+        char reject_reason[256];
+        if (is_ai_content_bad(content, reject_reason, sizeof(reject_reason))) {
+            debug_log("[ai_content_rejected] room=%d player=%s content=%s reason=%s",
+                      room->id, p->name, content[0] ? content : "(empty)", reject_reason);
+            if (gen_retry < 2) {
+                char ai_reason[256] = "";
+                char review_out[1024] = "";
+                gen_retry++;
+                /* 像玩家被拒绝一样，让审核AI根据情境给出具体理由。 */
+                if (ai_review_sentence(room->name, players_text, room->judge_log,
+                                       content, review_out, sizeof(review_out))) {
+                    JsonValue *rv = json_parse(review_out);
+                    if (rv) {
+                        const char *r = json_get_string(rv, "reason", "");
+                        if (r && *r) snprintf(ai_reason, sizeof(ai_reason), "%s", r);
+                        json_free(rv);
+                    }
+                }
+                if (!ai_reason[0]) {
+                    snprintf(ai_reason, sizeof(ai_reason), "%s", reject_reason);
+                }
+                strncat(constraint, "；你上一次的发言被拒绝，原因是：", sizeof(constraint) - strlen(constraint) - 1);
+                strncat(constraint, ai_reason, sizeof(constraint) - strlen(constraint) - 1);
+                strncat(constraint, "。请重新生成一句新的、完全不同的合格发言。", sizeof(constraint) - strlen(constraint) - 1);
+                content_ok = 0;
+                content[0] = '\0';
+                goto retry_generate;
+            }
+            content_ok = 0;
+            content[0] = '\0';
+        }
+    }
+    /* 下回合限制：无法移动时，若生成内容包含移动动作则回退。 */
+    if (content_ok && p->next_turn_penalty == 2 && contains_move_marker(content)) {
+        content_ok = 0;
+        content[0] = '\0';
+        debug_log("[penalty] room=%d player=%s penalty=2 action=no_move", room->id, p->name);
+    }
     if (!content_ok) {
         if (attack_mode && attack_target_id > 0) {
             int ti = player_by_id(room, attack_target_id);
             if (ti >= 0) {
-                snprintf(content, sizeof(content), "我向%s发起了攻击。", room->players[ti].name);
+                snprintf(content, sizeof(content), "我抄起手边最近的硬物，朝%s猛砸过去。", room->players[ti].name);
                 attack_danger = 0;
                 attack_reason[0] = '\0';
             }
@@ -582,7 +980,7 @@ if (!p->has_spoken_first) {
         if (content[0] == '\0') {
             if (ai_is_configured()) {
                 if (!p->has_spoken_first) snprintf(content, sizeof(content), "我走出了家门。");
-                else snprintf(content, sizeof(content), "我保持沉默。");
+                else snprintf(content, sizeof(content), "我警惕地环顾四周，寻找破绽。");
             } else if (!p->has_spoken_first) {
                 snprintf(content, sizeof(content), "我走出了家门。");
             } else if (player_has_unresolved_warning(room, p->id)) {
@@ -611,6 +1009,22 @@ if (!p->has_spoken_first) {
     n->damage = attack_mode ? attack_damage : 0;
     room->narrative_count++;
     p->has_spoken_first = 1;
+    p->next_turn_penalty = 0;   /* 本回合限制已生效，清除；灾厄可能设置新的下回合限制 */
+
+    {
+        char history_line[AI_HISTORY_MSG_LEN];
+        snprintf(history_line, sizeof(history_line), "%s：%s", p->name, content);
+        ai_history_push(p, history_line);
+        judge_log_append(room, history_line);
+    }
+
+    debug_log("[ai_speak] room=%d ai=%s op=%d target=%d damage=%d content=%s",
+              room->id, p->name, op, attack_mode ? attack_target_id : 0,
+              attack_mode ? attack_damage : 0, content);
+
+    /* 灾祸值：AI 发言同样按合理度增减，并尝试触发灾祸。 */
+    adjust_calamity(p, sentence_reasonableness(content, op));
+    try_trigger_calamity(room, p);
 
     /* 伤害结算：AI 攻击先扣血，死亡则不再额外创建濒死警告。 */
     if (attack_mode && attack_target_id > 0 && attack_damage > 0) {
@@ -634,6 +1048,8 @@ if (!p->has_spoken_first) {
             } else {
                 safe_copy(w->reason, sizeof(w->reason), content);
             }
+            debug_log("[warning_create] room=%d victim=%d source=%d reason=%s",
+                      room->id, attack_target_id, p->id, w->reason);
             room->warning_count++;
         }
     }
@@ -672,9 +1088,15 @@ if (!p->has_spoken_first) {
                 int v = atoi(env_chance);
                 if (v >= 0 && v <= 100) rescue_chance = v;
             }
+            /* 连续成功自救后成功率下降，避免无限秒解。 */
+            rescue_chance -= p->rescue_streak * 10;
+            if (rescue_chance < 20) rescue_chance = 20;
             if (rand() % 100 < rescue_chance) {
+                p->rescue_streak++;
                 resolve_victim_warnings(room, p->id);
                 apply_heal(room, p, 2);
+            } else {
+                p->rescue_streak = 0;
             }
         }
     }
@@ -756,7 +1178,7 @@ Player *game_find_player(Room *room, const char *token)
     return NULL;
 }
 
-int game_create_room(const char *room_name, int mode, const char *player_name, char *token_out)
+int game_create_room(const char *room_name, int mode, int difficulty, const char *player_name, char *token_out)
 {
     Room *room;
     int idx;
@@ -768,6 +1190,8 @@ int game_create_room(const char *room_name, int mode, const char *player_name, c
     memset(room, 0, sizeof(*room));
     room->id = g_next_room_id++;
     room->mode = mode ? MODE_GM : MODE_AUTO;
+    room->difficulty = difficulty > 0 ? 1 : 0;
+    room->scene_item_count = 0;
     room->status = ROOM_WAITING;
     safe_copy(room->name, sizeof(room->name), room_name && *room_name ? room_name : "乱杀房间");
 
@@ -786,6 +1210,8 @@ int game_create_room(const char *room_name, int mode, const char *player_name, c
     room->winner_id = 0;
 
     if (token_out) safe_copy(token_out, TOKEN_LEN + 1, room->players[0].token);
+    debug_log("[session] ============ new room ============");
+    debug_log("[room] create room_id=%d name=%s owner=%s difficulty=%d", room->id, room->name, room->players[0].name, room->difficulty);
     return room->id;
 }
 
@@ -862,9 +1288,20 @@ int game_set_ready(int room_id, const char *token, int ready)
 
 static void advance_one(Room *room)
 {
+    int i;
     if (room->player_count == 0) return;
     room->turn_index = (room->turn_index + 1) % room->player_count;
-    if (room->turn_index == 0) room->round++;
+    if (room->turn_index == 0) {
+        room->round++;
+        /* 困难难度：每轮所有存活玩家灾厄自动 +1 */
+        if (room->difficulty >= 1) {
+            for (i = 0; i < room->player_count; i++) {
+                if (room->players[i].alive) {
+                    room->players[i].calamity++;
+                }
+            }
+        }
+    }
 }
 static void advance_to_next_alive(Room *room)
 {
@@ -914,6 +1351,9 @@ int game_start(int room_id, const char *token, int fill_ai)
     }
 
     room->status = ROOM_PLAYING;
+    room->scene_item_count = 0;
+    room->judge_log[0] = '\0';
+    init_scene_items(room);
     room->turn_index = 0;
     room->round = 1;
     room->winner_id = 0;
@@ -965,32 +1405,78 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
             return -9;
         }
     }
-/* AI strengthened review: reasonableness + single predicate. */
+
+    /* 下回合限制：无法攻击 */
+    if (cp->next_turn_penalty == 1) {
+        int is_attack = (operation == OP_TWIST && target_id > 0) ||
+                        strstr(content, "刺") || strstr(content, "砍") ||
+                        strstr(content, "捅") || strstr(content, "射") ||
+                        strstr(content, "劈") || strstr(content, "杀");
+        if (is_attack) {
+            debug_log("[penalty] room=%d player=%s penalty=1 action=no_attack", room->id, cp->name);
+            if (error_msg && error_size > 0) snprintf(error_msg, error_size, "你受到灾厄影响，本回合无法攻击");
+            return -13;
+        }
+    }
+    /* 下回合限制：无法移动 */
+    if (cp->next_turn_penalty == 2 && contains_move_marker(content)) {
+        debug_log("[penalty] room=%d player=%s penalty=2 action=no_move", room->id, cp->name);
+        if (error_msg && error_size > 0) snprintf(error_msg, error_size, "你受到灾厄影响，本回合无法移动");
+        return -14;
+    }
+    /* 下回合限制：随机行动 */
+    if (cp->next_turn_penalty == 4) {
+        operation = rand() % 5;   /* OP_NORMAL..OP_LIMIT */
+        debug_log("[penalty] room=%d player=%s penalty=4 action=random", room->id, cp->name);
+    }
+/* AI strengthened review + random determination, merged into one request. */
     if (ai_is_configured()) {
         char players_text[512] = "";
         char ai_reason[256] = "";
         int valid_reason = 1;
         int valid_predicate = 1;
         int valid_mode = 1;
+        int need_roll = 0;
+        int difficulty = 3;
+        int plausibility = 3;
+        int preparation = 3;
         int i;
+        int start2;
+        char recent_text2[1024] = "";
 
         for (i = 0; i < room->player_count; i++) {
             if (i) strncat(players_text, ", ", sizeof(players_text) - strlen(players_text) - 1);
             strncat(players_text, room->players[i].name,
                     sizeof(players_text) - strlen(players_text) - 1);
         }
+        start2 = room->narrative_count > 3 ? room->narrative_count - 3 : 0;
+        for (i = start2; i < room->narrative_count; i++) {
+            char line[600];
+            int pi2 = player_by_id(room, room->narratives[i].player_id);
+            snprintf(line, sizeof(line), "%s：%s\n",
+                     pi2 >= 0 ? room->players[pi2].name : "系统",
+                     room->narratives[i].content);
+            strncat(recent_text2, line, sizeof(recent_text2) - strlen(recent_text2) - 1);
+        }
 
-        if (ai_validate_narration(room->name, players_text, p->name, content, operation,
-                                  !p->has_spoken_first,
-                                  &valid_reason, &valid_predicate, &valid_mode,
-                                  ai_reason, sizeof(ai_reason)) == 1) {
-            if (!valid_reason || !valid_predicate || !valid_mode) {
-                if (error_msg && error_size > 0) {
-                    snprintf(error_msg, error_size, "%s",
-                             ai_reason[0] ? ai_reason : "发言不合理或不符合单一谓语规则");
-                }
-                return -11;
+        if (!p->has_spoken_first) {
+            need_roll = 0;
+        } else if (ai_judge_player_narration(room->name, players_text, p->name,
+                                             content, operation, !p->has_spoken_first,
+                                             recent_text2,
+                                             &valid_reason, &valid_predicate, &valid_mode,
+                                             &need_roll, &difficulty, &plausibility,
+                                             &preparation,
+                                             ai_reason, sizeof(ai_reason)) != 1) {
+            need_roll = heuristic_need_roll(content, operation);
+        }
+
+        if (!valid_reason || !valid_predicate || !valid_mode) {
+            if (error_msg && error_size > 0) {
+                snprintf(error_msg, error_size, "%s",
+                         ai_reason[0] ? ai_reason : "发言不合理或不符合单一谓语规则");
             }
+            return -11;
         }
         /* 首句离家设定：无论 AI 是否放行，第一句必须包含离家动作。 */
         if (!p->has_spoken_first && !contains_home_exit(content)) {
@@ -998,52 +1484,6 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
                 snprintf(error_msg, error_size, "第一句话应该类似“我走出了家门”");
             }
             return -11;
-        }
-    } else if (!p->has_spoken_first && !contains_home_exit(content)) {
-        if (error_msg && error_size > 0) {
-            snprintf(error_msg, error_size, "第一句话应该类似“我走出了家门”");
-        }
-        return -11;
-    }
-
-    /* Random determination: reviewer decides whether a dice check is needed. */
-    {
-        int need_roll = 0;
-        int difficulty = 3;
-        int plausibility = 3;
-        int preparation = 3;
-        char rc_reason[256] = "";
-        char players_text2[512] = "";
-        char recent_text2[1024] = "";
-        int k;
-        int start2;
-
-        for (k = 0; k < room->player_count; k++) {
-            if (k) strncat(players_text2, ", ", sizeof(players_text2) - strlen(players_text2) - 1);
-            strncat(players_text2, room->players[k].name,
-                    sizeof(players_text2) - strlen(players_text2) - 1);
-        }
-        start2 = room->narrative_count > 3 ? room->narrative_count - 3 : 0;
-        for (k = start2; k < room->narrative_count; k++) {
-            char line[600];
-            int pi2 = player_by_id(room, room->narratives[k].player_id);
-            snprintf(line, sizeof(line), "%s：%s\n",
-                     pi2 >= 0 ? room->players[pi2].name : "系统",
-                     room->narratives[k].content);
-            strncat(recent_text2, line, sizeof(recent_text2) - strlen(recent_text2) - 1);
-        }
-
-        if (!p->has_spoken_first) {
-            /* Traditional opening sentence always succeeds. */
-            need_roll = 0;
-        } else if (ai_is_configured()) {
-            if (ai_judge_random_check(room->name, players_text2, p->name, content, operation,
-                                      recent_text2, &need_roll, &difficulty, &plausibility,
-                                      &preparation, rc_reason, sizeof(rc_reason)) != 1) {
-                need_roll = heuristic_need_roll(content, operation);
-            }
-        } else {
-            need_roll = heuristic_need_roll(content, operation);
         }
 
         if (need_roll) {
@@ -1055,9 +1495,25 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
             roll_used = 1;
             p->last_roll_failed = roll_success ? 0 : 1;
             snprintf(roll_note, sizeof(roll_note),
-                     "判定 %d/%d %s（难度%d 合理%d 铺垫%d）",
-                     roll_value, roll_chance, roll_success ? "成功" : "失败",
-                     difficulty, plausibility, preparation);
+                     roll_success ? "行动顺利推进。" : "行动没有完全达到预期。");
+        }
+    } else if (!p->has_spoken_first && !contains_home_exit(content)) {
+        if (error_msg && error_size > 0) {
+            snprintf(error_msg, error_size, "第一句话应该类似“我走出了家门”");
+        }
+        return -11;
+    } else {
+        /* No AI configured: use heuristic random check only. */
+        int need_roll = heuristic_need_roll(content, operation);
+        if (need_roll) {
+            int luck = p->last_roll_failed ? ROLL_LUCK_BONUS : 0;
+            roll_chance = compute_roll_chance(3, 3, 3, operation, luck);
+            roll_value = roll_d100();
+            roll_success = roll_value <= roll_chance ? 1 : 0;
+            roll_used = 1;
+            p->last_roll_failed = roll_success ? 0 : 1;
+            snprintf(roll_note, sizeof(roll_note),
+                     roll_success ? "行动顺利推进。" : "行动没有完全达到预期。");
         }
     }
 
@@ -1085,11 +1541,27 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
     safe_copy(n->roll_note, sizeof(n->roll_note), roll_note);
     room->narrative_count++;
     p->has_spoken_first = 1;
+    p->next_turn_penalty = 0;   /* 本回合限制已生效，清除；灾厄可能设置新的下回合限制 */
 
-    /* A failed random check means the attempted event does not take effect. */
+    {
+        char judge_line[AI_HISTORY_MSG_LEN];
+        snprintf(judge_line, sizeof(judge_line), "%s：%s", p->name, content);
+        judge_log_append(room, judge_line);
+    }
+
+    debug_log("[speak] room=%d player=%s op=%d target=%d content=%s",
+              room->id, p->name, operation, target_id, content);
+
+    /* 灾祸值：根据发言合理度增减，并尝试触发灾祸。 */
+    adjust_calamity(p, sentence_reasonableness(content, operation));
+    try_trigger_calamity(room, p);
+
+    /* 随机判定失败改为“效果打折”：伤害减半（至少保留1点），不跳过回合。 */
     if (roll_used && !roll_success) {
-        advance_to_next_alive(room);
-        return 0;
+        if (n->damage > 0) {
+            int half = n->damage / 2;
+            n->damage = half > 0 ? half : 1;
+        }
     }
 
     /* 伤害结算：成功且指定目标时扣血；目标死亡则后续不再创建濒死警告。 */
@@ -1159,6 +1631,8 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
                 } else {
                     snprintf(w->reason, sizeof(w->reason), "%s", content);
                 }
+                debug_log("[warning_create] room=%d victim=%d source=%d reason=%s",
+                          room->id, warn_target_id, p->id, w->reason);
                 room->warning_count++;
             }
         } else {
@@ -1174,6 +1648,8 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
                 w->narrative_id = n->id;
                 w->resolved = 0;
                 snprintf(w->reason, sizeof(w->reason), "%s", content);
+                debug_log("[warning_create] room=%d victim=%d source=%d reason=%s",
+                          room->id, warn_target_id, p->id, w->reason);
                 room->warning_count++;
             }
         }
@@ -1234,6 +1710,21 @@ static void finish_if_one_alive(Room *room)
     if (alive_count <= 1 && room->status == ROOM_PLAYING) {
         room->status = ROOM_ENDED;
         room->winner_id = alive_count == 1 ? last : 0;
+
+        /* 独立审核对话：整场结束后交给审核AI。 */
+        if (ai_is_configured()) {
+            char players_text[512] = "";
+            char review_out[1024] = "";
+            for (i = 0; i < room->player_count; i++) {
+                if (i) strncat(players_text, ", ", sizeof(players_text) - strlen(players_text) - 1);
+                strncat(players_text, room->players[i].name,
+                        sizeof(players_text) - strlen(players_text) - 1);
+            }
+            if (ai_review_game(room->name, players_text, room->judge_log,
+                               review_out, sizeof(review_out))) {
+                debug_log("[review] room=%d result=%s", room->id, review_out);
+            }
+        }
     }
 }
 
@@ -1288,6 +1779,11 @@ static void apply_damage(Room *room, int target_id, int damage, int source_id)
         /* 任何伤害都不能直接致死：先进入濒死，生命保留 1，并生成濒死警告。 */
         target->hp = 1;
     }
+
+    debug_log("[damage] room=%d target=%s source=%d damage=%d hp=%d/%d status=%s",
+              room->id, target->name, source_id, damage, target->hp, target->max_hp,
+              status ? "adjusted" : "applied");
+
     if (target->hp <= 1 && room->warning_count < MAX_WARNINGS &&
         !player_has_unresolved_warning(room, target_id)) {
         /* 生命过低时自动进入濒死状态，死亡前必须存在濒死警告。 */
@@ -1298,7 +1794,9 @@ static void apply_damage(Room *room, int target_id, int damage, int source_id)
         w->source_id = source_id;
         w->narrative_id = 0;
         w->resolved = 0;
-        snprintf(w->reason, sizeof(w->reason), "生命值过低，陷入濒死状态");
+        snprintf(w->reason, sizeof(w->reason), "你感到体力正在快速流失，视线逐渐模糊");
+        debug_log("[warning_create] room=%d victim=%d source=%d reason=%s",
+                  room->id, target_id, source_id, w->reason);
         room->warning_count++;
     }
 }
@@ -1317,7 +1815,9 @@ static void ensure_warning_before_death(Room *room, int victim_id, int source_id
         w->source_id = source_id;
         w->narrative_id = 0;
         w->resolved = 0;
-        snprintf(w->reason, sizeof(w->reason), "濒死状态未解除，被宣告死亡");
+        snprintf(w->reason, sizeof(w->reason), "你已无力再战，只能任人处置");
+        debug_log("[warning_create] room=%d victim=%d source=%d reason=%s",
+                  room->id, victim_id, source_id, w->reason);
         room->warning_count++;
     }
 }
@@ -1365,16 +1865,7 @@ static int ai_try_declare_death(Room *room)
             candidates[cc++] = room->players[vi].id;
         }
     }
-    /* 候选2：生命≤1的濒死玩家，允许补刀终结。 */
-    for (i = 0; i < room->player_count; i++) {
-        int j, dup = 0;
-        if (room->players[i].id == p->id || !room->players[i].alive) continue;
-        if (room->players[i].hp > 1) continue;
-        for (j = 0; j < cc; j++) {
-            if (candidates[j] == room->players[i].id) { dup = 1; break; }
-        }
-        if (!dup) candidates[cc++] = room->players[i].id;
-    }
+    /* 濒死警告只能由触发者宣告死亡，不允许 HP≤1 补刀。 */
     if (cc == 0) return 0;
 
     if (env_chance && *env_chance) {
@@ -1387,12 +1878,25 @@ static int ai_try_declare_death(Room *room)
         int pick = candidates[rand() % cc];
         int vi = player_by_id(room, pick);
         if (vi >= 0) {
-            ensure_warning_before_death(room, pick, p->id);
-            room->players[vi].alive = 0;
-            announce_death(room, pick);
-            finish_if_one_alive(room);
-            if (room->status == ROOM_PLAYING) advance_to_next_alive(room);
-            return 1;
+            int j, has_own_warning = 0;
+            /* 二次校验：必须确实存在自己造成的未解除濒死警告。 */
+            for (j = 0; j < room->warning_count; j++) {
+                Warning *w = &room->warnings[j];
+                if (w->source_id == p->id && w->victim_id == pick && !w->resolved) {
+                    has_own_warning = 1;
+                    break;
+                }
+            }
+            if (has_own_warning) {
+                ensure_warning_before_death(room, pick, p->id);
+                room->players[vi].alive = 0;
+                announce_death(room, pick);
+                debug_log("[death] room=%d source=%s victim=%s by=ai_declare reason=warning",
+                          room->id, p->name, room->players[vi].name);
+                finish_if_one_alive(room);
+                if (room->status == ROOM_PLAYING) advance_to_next_alive(room);
+                return 1;
+            }
         }
     }
     return 0;
@@ -1410,12 +1914,16 @@ int game_declare_death(int room_id, const char *token, int target_id)
     if (room->status != ROOM_PLAYING) return -2;
 
     if (target_id == p->id) {
+        int is_my_turn = room->player_count > 0 &&
+                         room->players[room->order[room->turn_index]].id == p->id;
         if (!p->alive) return -7;
         ensure_warning_before_death(room, p->id, p->id);
         p->alive = 0;
         announce_death(room, p->id);
+        debug_log("[death] room=%d source=%s victim=%s by=suicide", room->id, p->name, p->name);
         finish_if_one_alive(room);
-        if (room->status == ROOM_PLAYING) advance_to_next_alive(room);
+        /* 只有自己回合自杀才推进；非自己回合自杀不应跳过当前回合者。 */
+        if (room->status == ROOM_PLAYING && is_my_turn) advance_to_next_alive(room);
         return 0;
     }
 
@@ -1436,16 +1944,14 @@ int game_declare_death(int room_id, const char *token, int target_id)
             break;
         }
     }
-    /* 目标生命≤1 时视为可补刀终结，不再强制要求来源警告。 */
-    if (!found_unresolved && room->players[ti].hp <= 1) {
-        found_unresolved = 1;
-    }
+    /* 濒死警告只能由触发者宣告死亡，不允许仅凭 HP≤1 补刀。 */
     if (!found_unresolved) return -5;
     if (!room->players[ti].alive) return -6;
 
     ensure_warning_before_death(room, target_id, p->id);
     room->players[ti].alive = 0;
     announce_death(room, target_id);
+    debug_log("[death] room=%d source=%s victim=%s by=declare", room->id, p->name, room->players[ti].name);
     finish_if_one_alive(room);
     if (room->status == ROOM_PLAYING) advance_to_next_alive(room);
     return 0;
@@ -1469,6 +1975,7 @@ int game_gm_command(int room_id, const char *token, const char *action, int targ
         ensure_warning_before_death(room, target_id, p->id);
         room->players[ti].alive = 0;
         announce_death(room, target_id);
+        debug_log("[death] room=%d source=%s victim=%s by=gm", room->id, p->name, room->players[ti].name);
         finish_if_one_alive(room);
         return 0;
     }
@@ -1514,6 +2021,16 @@ int game_room_to_json_ex(int room_id, const char *token, JsonBuf *out, int proce
 
     if (!room) return -1;
     if (process_ai) {
+        /* 玩家“跳过下回合”在状态轮询时自动生效。 */
+        if (room->player_count > 0 && room->turn_index >= 0 &&
+            room->turn_index < room->player_count) {
+            Player *cp = &room->players[room->order[room->turn_index]];
+            if (!cp->is_ai && cp->alive && cp->next_turn_penalty == 3) {
+                cp->next_turn_penalty = 0;
+                debug_log("[penalty] room=%d player=%s penalty=3 action=skip_turn", room->id, cp->name);
+                advance_to_next_alive(room);
+            }
+        }
         /* Process at most one pending AI turn or one AI danger judgment per poll. */
         process_one_pending_ai_action(room);
     }
@@ -1526,6 +2043,7 @@ int game_room_to_json_ex(int room_id, const char *token, JsonBuf *out, int proce
     jsonb_append(out, ",");
     jsonb_appendf(out, "\"status\":%d,", room->status);
     jsonb_appendf(out, "\"mode\":%d,", room->mode);
+    jsonb_appendf(out, "\"difficulty\":%d,", room->difficulty);
     jsonb_appendf(out, "\"round\":%d,", room->round);
     jsonb_appendf(out, "\"turn_index\":%d,", room->turn_index);
     jsonb_appendf(out, "\"turn_player_id\":%d,", room->player_count > 0 ? room->players[room->order[room->turn_index]].id : 0);
@@ -1583,6 +2101,8 @@ int game_room_to_json_ex(int room_id, const char *token, JsonBuf *out, int proce
             jsonb_string(out, n->limit_keyword);
             jsonb_appendf(out, ",\"target_id\":%d", n->target_id);
             jsonb_appendf(out, ",\"damage\":%d", n->damage);
+            jsonb_appendf(out, ",\"calamity\":%s", n->calamity ? "true" : "false");
+            jsonb_appendf(out, ",\"notice\":%s", n->notice ? "true" : "false");
             jsonb_appendf(out, ",\"roll_used\":%s", n->roll_used ? "true" : "false");
             jsonb_appendf(out, ",\"roll_value\":%d", n->roll_value);
             jsonb_appendf(out, ",\"roll_chance\":%d", n->roll_chance);
