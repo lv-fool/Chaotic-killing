@@ -19,6 +19,21 @@ Room g_rooms[MAX_ROOMS];
 int g_room_count = 0;
 int g_next_room_id = 1;
 
+/* 随机行动发言模板（penalty=4 时使用）。 */
+static const char *random_action_lines[] = {
+    "我环顾四周，保持警惕。",
+    "我悄悄移动到掩体后面。",
+    "我观察着每个人的动作。",
+    "我握紧武器，准备应对突发情况。",
+    "我保持沉默，等待时机。",
+    "我缓缓后退，拉开距离。",
+    "我在角落里布下了一个小陷阱。",
+    "我蹲下系鞋带，趁机记住每个人的站位。",
+    "我低声吹着口哨，慢慢靠近门口。",
+    "我捡起一片碎玻璃，反射着光观察众人。"
+};
+#define RANDOM_ACTION_LINES_COUNT (int)(sizeof(random_action_lines) / sizeof(random_action_lines[0]))
+
 static void safe_copy(char *dst, size_t size, const char *src)
 {
     if (!dst || size == 0) return;
@@ -99,8 +114,11 @@ static void numeric_audit_log(const char *op, const char *context,
 /* 返回 0=按原操作生效，1=已调整 */
 static int numeric_review(const char *op, const char *context,
                           NumericReason reason, int current, int proposed,
-                          int *final_value)
+                          int difficulty, int *final_value)
 {
+    static const int high_threshold[] = { 95, 90, 85, 80, 75 };
+    static const int med_threshold[]  = { 70, 60, 55, 50, 45 };
+    static const int low_threshold[]  = { 50, 30, 25, 20, 15 };
     int threshold;
     int roll;
     int pass;
@@ -108,12 +126,14 @@ static int numeric_review(const char *op, const char *context,
     int adjusted_delta;
     int final;
 
+    if (difficulty < 0) difficulty = 0;
+    if (difficulty > 4) difficulty = 4;
     if (!final_value) return 1;
     *final_value = current;
 
-    if (reason == NUMERIC_REASON_HIGH) threshold = 90;
-    else if (reason == NUMERIC_REASON_MEDIUM) threshold = 60;
-    else threshold = 30;
+    if (reason == NUMERIC_REASON_HIGH) threshold = high_threshold[difficulty];
+    else if (reason == NUMERIC_REASON_MEDIUM) threshold = med_threshold[difficulty];
+    else threshold = low_threshold[difficulty];
 
     roll = numeric_d100(numeric_hash(context));
     pass = roll <= threshold;
@@ -151,7 +171,7 @@ static NumericReason numeric_reason_for_heal(int current_hp, int max_hp)
 
 /* 灾祸值：根据发言合理度增减。 */
 static int player_has_unresolved_warning(Room *room, int player_id);
-static void apply_damage(Room *room, int target_id, int damage, int source_id);
+static void apply_damage(Room *room, int target_id, int damage, int source_id, int create_warning);
 static NumericReason sentence_reasonableness(const char *content, int operation)
 {
     static const char *bad_words[] = {
@@ -214,6 +234,37 @@ static void add_notice_narrative(Room *room, int player_id, const char *text)
     room->narrative_count++;
 }
 
+static void add_green_narrative(Room *room, int player_id, const char *text)
+{
+    Narrative *n;
+    int i;
+    if (!room || room->narrative_count >= MAX_NARRATIVES || !text) return;
+    n = &room->narratives[room->narrative_count];
+    memset(n, 0, sizeof(*n));
+    n->id = room->narrative_count + 1;
+    n->room_id = room->id;
+    n->player_id = player_id;
+    n->round = room->round;
+    n->operation = OP_NORMAL;
+    if (player_id > 0) {
+        int found = 0;
+        for (i = 0; i < room->player_count; i++) {
+            if (room->players[i].id == player_id) {
+                snprintf(n->content, sizeof(n->content), "%s，%s",
+                         room->players[i].name, text);
+                found = 1;
+                break;
+            }
+        }
+        if (!found) snprintf(n->content, sizeof(n->content), "%s", text);
+    } else {
+        snprintf(n->content, sizeof(n->content), "%s", text);
+    }
+    n->target_id = player_id;
+    n->green = 1;
+    room->narrative_count++;
+}
+
 static void try_trigger_calamity(Room *room, Player *p)
 {
     static const char *damage_lines[] = {
@@ -233,6 +284,7 @@ static void try_trigger_calamity(Room *room, Player *p)
     int damage = 0;
     const char *text;
     const char *notice_text = NULL;
+    char notice_buf[160];
     Narrative *n;
 
     if (!room || !p || !p->alive) return;
@@ -242,14 +294,14 @@ static void try_trigger_calamity(Room *room, Player *p)
     if (rand() % 100 >= chance) return;
     if (room->narrative_count >= MAX_NARRATIVES) return;
 
-    /* 灾厄类型随机：0=伤害，1=下回合限制 */
-    type = rand() % 2;
+    /* 灾厄类型随机：0=伤害，1=下回合限制，2=命运诅咒，3=生命诅咒 */
+    type = rand() % 4;
     if (type == 0) {
         int idx = rand() % (sizeof(damage_lines) / sizeof(damage_lines[0]));
         static const int fixed_damage[] = { 1, 1, 2, 2 };
         damage = fixed_damage[idx];
         text = damage_lines[idx];
-    } else {
+    } else if (type == 1) {
         int idx = rand() % (sizeof(wound_lines) / sizeof(wound_lines[0]));
         static const int penalties[] = { 1, 2, 3, 4 };
         static const char *notices[] = {
@@ -260,7 +312,14 @@ static void try_trigger_calamity(Room *room, Player *p)
         };
         p->next_turn_penalty = penalties[idx];
         text = wound_lines[idx];
-        notice_text = notices[idx];
+        snprintf(notice_buf, sizeof(notice_buf), "%s，%s", p->name, notices[idx]);
+        notice_text = notice_buf;
+    } else if (type == 2) {
+        text = "你遭受了命运的诅咒";
+        p->curse_turns = 2;
+    } else {
+        text = "你遭受了生命诅咒";
+        p->life_curse_turns = 2;
     }
 
     /* 先记录红色灾厄事件，归属系统。 */
@@ -271,7 +330,7 @@ static void try_trigger_calamity(Room *room, Player *p)
     n->player_id = 0;
     n->round = room->round;
     n->operation = OP_TWIST;
-    snprintf(n->content, sizeof(n->content), "%s", text);
+    snprintf(n->content, sizeof(n->content), "%s，%s", p->name, text);
     n->target_id = p->id;
     n->damage = damage;
     n->calamity = 1;
@@ -284,12 +343,33 @@ static void try_trigger_calamity(Room *room, Player *p)
 
     p->calamity = 0;
 
-    debug_log("[calamity] room=%d player=%s type=%s penalty=%d damage=%d",
-              room->id, p->name, type == 0 ? "damage" : "penalty",
-              p->next_turn_penalty, damage);
+    debug_log("[calamity] room=%d player=%s type=%s penalty=%d damage=%d curse=%d",
+              room->id, p->name,
+              type == 0 ? "damage" : (type == 1 ? "penalty" : (type == 2 ? "curse" : "life_curse")),
+              p->next_turn_penalty, damage, p->curse_turns);
 
     if (type == 0) {
-        apply_damage(room, p->id, damage, 0);
+        apply_damage(room, p->id, damage, 0, 0);
+        /* 灾厄导致生命值过低：不产生濒死警告，改为体力不支跳过一回合并恢复。 */
+        if (p->alive && p->hp <= 1) {
+            p->hp = 2;   /* 恢复到不致濒死的最低水平 */
+            p->next_turn_penalty = 3; /* 下回合跳过 */
+            if (room->narrative_count < MAX_NARRATIVES) {
+                Narrative *n2 = &room->narratives[room->narrative_count];
+                memset(n2, 0, sizeof(*n2));
+                n2->id = room->narrative_count + 1;
+                n2->room_id = room->id;
+                n2->player_id = 0;
+                n2->round = room->round;
+                n2->operation = OP_TWIST;
+                snprintf(n2->content, sizeof(n2->content), "%s，体力不支，本回合无法行动", p->name);
+                n2->target_id = p->id;
+                n2->calamity = 1;
+                room->narrative_count++;
+            }
+            debug_log("[calamity] room=%d player=%s exhausted hp=%d penalty=3",
+                      room->id, p->name, p->hp);
+        }
     }
     /* type == 1 时只设置 next_turn_penalty，不额外施加濒死警告。 */
 }
@@ -538,6 +618,9 @@ static int heuristic_damage(const char *s, int operation)
 #define ROLL_MIN          5
 #define ROLL_MAX         95
 
+/* 难度对随机判定成功率的偏移：休闲/普通/困难/噩梦/地狱 */
+static const int difficulty_chance_bonus[] = { 10, 0, -10, -20, -30 };
+
 static int operation_roll_weight(int operation)
 {
     switch (operation) {
@@ -647,7 +730,7 @@ static void advance_to_next_alive(Room *room);
 static void ai_speak_current(Room *room);
 static void announce_death(Room *room, int victim_id);
 static void finish_if_one_alive(Room *room);
-static void apply_damage(Room *room, int target_id, int damage, int source_id);
+static void apply_damage(Room *room, int target_id, int damage, int source_id, int create_warning);
 static void apply_heal(Room *room, Player *p, int amount);
 static int ai_try_declare_death(Room *room);
 static int process_one_pending_ai_action(Room *room)
@@ -764,6 +847,11 @@ static void ai_speak_current(Room *room)
     int rescue_used = 0;
     int rescue_success = 0;
     char rescue_reason[256] = "";
+    int roll_used = 0;
+    int roll_value = 0;
+    int roll_chance = 0;
+    int roll_success = 1;
+    char roll_note[128] = "";
     content[0] = '\0';
 
     if (!room || room->status != ROOM_PLAYING || room->player_count == 0) return;
@@ -773,7 +861,11 @@ static void ai_speak_current(Room *room)
     if (room->narrative_count >= MAX_NARRATIVES) return;
 
     if (p->next_turn_penalty == 4) {
+        snprintf(content, sizeof(content), "%s",
+                 random_action_lines[rand() % RANDOM_ACTION_LINES_COUNT]);
+        content_ok = 1;
         debug_log("[penalty] room=%d player=%s penalty=4 action=random_ai", room->id, p->name);
+        goto after_generation;
     }
 
     for (i = 0; i < room->player_count; i++) {
@@ -894,6 +986,9 @@ retry_generate:
                         attack_target_id = room->players[ti].id;
                     }
                 }
+            } else {
+                debug_log("[ai_attack_gen_failed] room=%d player=%s ai_text=%s",
+                          room->id, p->name, ai_text[0] ? ai_text : "(empty)");
             }
         } else if (player_has_unresolved_warning(room, p->id)) {
             if (ai_try_generate_rescue(room->name, players_text, p->name,
@@ -922,6 +1017,7 @@ retry_generate:
             content_ok = 1;
         }
     }
+after_generation:
     /* 简单去重：与最近一条完全相同的生成结果视为失败，走回退模板。 */
     if (content_ok && room->narrative_count > 0 &&
         strcmp(content, room->narratives[room->narrative_count - 1].content) == 0) {
@@ -975,6 +1071,8 @@ retry_generate:
                 snprintf(content, sizeof(content), "我抄起手边最近的硬物，朝%s猛砸过去。", room->players[ti].name);
                 attack_danger = 0;
                 attack_reason[0] = '\0';
+                debug_log("[ai_fallback] room=%d player=%s reason=attack_generation_failed",
+                          room->id, p->name);
             }
         }
         if (content[0] == '\0') {
@@ -1006,10 +1104,61 @@ retry_generate:
     safe_copy(n->limit_keyword, sizeof(n->limit_keyword),
               room->limit.keyword[0] ? room->limit.keyword : "");
     n->target_id = attack_mode ? attack_target_id : 0;
+    /* AI 受命运诅咒时，攻击有概率效果打折（伤害减半）。 */
+    if (attack_mode && attack_damage > 0 && p->curse_turns > 0 &&
+        rand() % 100 < 50) {
+        attack_damage = attack_damage / 2;
+        if (attack_damage < 1) attack_damage = 1;
+        debug_log("[curse] room=%d player=%s ai_attack_half", room->id, p->name);
+    }
+    /* AI 随机判定：攻击等不确定行动也过 d100，失败则效果打折。 */
+    if (attack_mode && attack_damage > 0 && heuristic_need_roll(content, op)) {
+        roll_chance = compute_roll_chance(3, 3, 3, op, 0);
+        roll_chance += difficulty_chance_bonus[room->difficulty];
+        if (p->curse_turns > 0) {
+            roll_chance -= 3 * 8;
+            if (roll_chance < ROLL_MIN) roll_chance = ROLL_MIN;
+        }
+        if (roll_chance > ROLL_MAX) roll_chance = ROLL_MAX;
+        roll_value = roll_d100();
+        roll_success = roll_value <= roll_chance ? 1 : 0;
+        roll_used = 1;
+        snprintf(roll_note, sizeof(roll_note),
+                 roll_success ? "行动顺利推进。" : "行动没有完全达到预期。");
+        if (!roll_success && attack_damage > 0) {
+            attack_damage = attack_damage / 2;
+            if (attack_damage < 1) attack_damage = 1;
+        }
+    }
     n->damage = attack_mode ? attack_damage : 0;
+    n->roll_used = roll_used;
+    n->roll_value = roll_value;
+    n->roll_chance = roll_chance;
+    n->roll_success = roll_success;
+    safe_copy(n->roll_note, sizeof(n->roll_note), roll_note);
     room->narrative_count++;
+    if (p->next_turn_penalty == 4) {
+        char green_line[160];
+        add_green_narrative(room, p->id, "恢复了神智清明");
+    }
     p->has_spoken_first = 1;
     p->next_turn_penalty = 0;   /* 本回合限制已生效，清除；灾厄可能设置新的下回合限制 */
+
+    if (p->curse_turns > 0) {
+        p->curse_turns--;
+        if (p->curse_turns == 0) {
+            add_green_narrative(room, p->id, "你感觉如释重负");
+        }
+    }
+
+    if (p->life_curse_turns > 0) {
+        p->life_curse_turns--;
+        if (p->hp > 1) p->hp--;
+        debug_log("[curse] room=%d player=%s life_hp=%d", room->id, p->name, p->hp);
+        if (p->life_curse_turns == 0) {
+            add_green_narrative(room, p->id, "你感觉身体恢复了活力");
+        }
+    }
 
     {
         char history_line[AI_HISTORY_MSG_LEN];
@@ -1028,7 +1177,7 @@ retry_generate:
 
     /* 伤害结算：AI 攻击先扣血，死亡则不再额外创建濒死警告。 */
     if (attack_mode && attack_target_id > 0 && attack_damage > 0) {
-        apply_damage(room, attack_target_id, attack_damage, p->id);
+        apply_damage(room, attack_target_id, attack_damage, p->id, 1);
     }
 
     /* AI 进攻并产生致命威胁时，创建濒死警告。 */
@@ -1082,7 +1231,8 @@ retry_generate:
 
         if (ai_ok == 1 ? rescued : contains_rescue_marker(content)) {
             /* AI 自救也应有失败率，避免“无限完美闪避”导致对局永远无法推进。 */
-            int rescue_chance = 70;
+            static const int rescue_base[] = { 85, 70, 55, 40, 25 };
+            int rescue_chance = rescue_base[room->difficulty];
             const char *env_chance = getenv("LUANSHA_AI_RESCUE_CHANCE");
             if (env_chance && *env_chance) {
                 int v = atoi(env_chance);
@@ -1190,7 +1340,9 @@ int game_create_room(const char *room_name, int mode, int difficulty, const char
     memset(room, 0, sizeof(*room));
     room->id = g_next_room_id++;
     room->mode = mode ? MODE_GM : MODE_AUTO;
-    room->difficulty = difficulty > 0 ? 1 : 0;
+    if (difficulty < 0) difficulty = 0;
+    if (difficulty > 4) difficulty = 4;
+    room->difficulty = difficulty;
     room->scene_item_count = 0;
     room->status = ROOM_WAITING;
     safe_copy(room->name, sizeof(room->name), room_name && *room_name ? room_name : "乱杀房间");
@@ -1293,11 +1445,12 @@ static void advance_one(Room *room)
     room->turn_index = (room->turn_index + 1) % room->player_count;
     if (room->turn_index == 0) {
         room->round++;
-        /* 困难难度：每轮所有存活玩家灾厄自动 +1 */
+        /* 难度灾厄自动累积：困难+1，噩梦+2，地狱+3 */
         if (room->difficulty >= 1) {
+            int gain = room->difficulty;
             for (i = 0; i < room->player_count; i++) {
                 if (room->players[i].alive) {
-                    room->players[i].calamity++;
+                    room->players[i].calamity += gain;
                 }
             }
         }
@@ -1379,6 +1532,7 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
     int roll_chance = 0;
     int roll_success = 1;
     char roll_note[128] = "";
+    char forced_content[MAX_CONTENT];
 
     if (error_msg && error_size > 0) error_msg[0] = '\0';
 
@@ -1424,9 +1578,12 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
         if (error_msg && error_size > 0) snprintf(error_msg, error_size, "你受到灾厄影响，本回合无法移动");
         return -14;
     }
-    /* 下回合限制：随机行动 */
+    /* 下回合限制：随机行动 → 随机发言 */
     if (cp->next_turn_penalty == 4) {
-        operation = rand() % 5;   /* OP_NORMAL..OP_LIMIT */
+        snprintf(forced_content, sizeof(forced_content), "%s",
+                 random_action_lines[rand() % RANDOM_ACTION_LINES_COUNT]);
+        content = forced_content;
+        operation = OP_NORMAL;
         debug_log("[penalty] room=%d player=%s penalty=4 action=random", room->id, cp->name);
     }
 /* AI strengthened review + random determination, merged into one request. */
@@ -1490,6 +1647,12 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
             int luck = p->last_roll_failed ? ROLL_LUCK_BONUS : 0;
             roll_chance = compute_roll_chance(difficulty, plausibility, preparation,
                                               operation, luck);
+            roll_chance += difficulty_chance_bonus[room->difficulty];
+            if (cp->curse_turns > 0) {
+                roll_chance -= difficulty * 8;
+                if (roll_chance < ROLL_MIN) roll_chance = ROLL_MIN;
+            }
+            if (roll_chance > ROLL_MAX) roll_chance = ROLL_MAX;
             roll_value = roll_d100();
             roll_success = roll_value <= roll_chance ? 1 : 0;
             roll_used = 1;
@@ -1508,6 +1671,12 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
         if (need_roll) {
             int luck = p->last_roll_failed ? ROLL_LUCK_BONUS : 0;
             roll_chance = compute_roll_chance(3, 3, 3, operation, luck);
+            roll_chance += difficulty_chance_bonus[room->difficulty];
+            if (cp->curse_turns > 0) {
+                roll_chance -= 3 * 8;
+                if (roll_chance < ROLL_MIN) roll_chance = ROLL_MIN;
+            }
+            if (roll_chance > ROLL_MAX) roll_chance = ROLL_MAX;
             roll_value = roll_d100();
             roll_success = roll_value <= roll_chance ? 1 : 0;
             roll_used = 1;
@@ -1540,8 +1709,27 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
     n->roll_success = roll_success;
     safe_copy(n->roll_note, sizeof(n->roll_note), roll_note);
     room->narrative_count++;
+    if (cp->next_turn_penalty == 4) {
+        add_green_narrative(room, p->id, "恢复了神智清明");
+    }
     p->has_spoken_first = 1;
     p->next_turn_penalty = 0;   /* 本回合限制已生效，清除；灾厄可能设置新的下回合限制 */
+
+    if (p->curse_turns > 0) {
+        p->curse_turns--;
+        if (p->curse_turns == 0) {
+            add_green_narrative(room, p->id, "你感觉如释重负");
+        }
+    }
+
+    if (p->life_curse_turns > 0) {
+        p->life_curse_turns--;
+        if (p->hp > 1) p->hp--;
+        debug_log("[curse] room=%d player=%s life_hp=%d", room->id, p->name, p->hp);
+        if (p->life_curse_turns == 0) {
+            add_green_narrative(room, p->id, "你感觉身体恢复了活力");
+        }
+    }
 
     {
         char judge_line[AI_HISTORY_MSG_LEN];
@@ -1566,7 +1754,7 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
 
     /* 伤害结算：成功且指定目标时扣血；目标死亡则后续不再创建濒死警告。 */
     if (target_id > 0 && n->damage > 0) {
-        apply_damage(room, target_id, n->damage, p->id);
+        apply_damage(room, target_id, n->damage, p->id, 1);
     }
 
     /* Near-death warning:
@@ -1752,7 +1940,8 @@ static void announce_death(Room *room, int victim_id)
     room->narrative_count++;
 }
 
-static void apply_damage(Room *room, int target_id, int damage, int source_id)
+static void apply_damage(Room *room, int target_id, int damage, int source_id,
+                         int create_warning)
 {
     int ti;
     Player *target;
@@ -1771,12 +1960,12 @@ static void apply_damage(Room *room, int target_id, int damage, int source_id)
     snprintf(ctx, sizeof(ctx), "damage:%d:%d:%d:%d:%d",
              room->id, source_id, target_id, damage, target->hp);
     status = numeric_review("damage", ctx, reason, target->hp,
-                            target->hp - damage, &final_hp);
+                            target->hp - damage, room->difficulty, &final_hp);
     target->hp = final_hp;
     target->numeric_status = status;
 
     if (target->hp <= 0) {
-        /* 任何伤害都不能直接致死：先进入濒死，生命保留 1，并生成濒死警告。 */
+        /* 任何伤害都不能直接致死：先进入濒死，生命保留 1。 */
         target->hp = 1;
     }
 
@@ -1784,7 +1973,7 @@ static void apply_damage(Room *room, int target_id, int damage, int source_id)
               room->id, target->name, source_id, damage, target->hp, target->max_hp,
               status ? "adjusted" : "applied");
 
-    if (target->hp <= 1 && room->warning_count < MAX_WARNINGS &&
+    if (create_warning && target->hp <= 1 && room->warning_count < MAX_WARNINGS &&
         !player_has_unresolved_warning(room, target_id)) {
         /* 生命过低时自动进入濒死状态，死亡前必须存在濒死警告。 */
         Warning *w = &room->warnings[room->warning_count];
@@ -1832,7 +2021,8 @@ static void apply_heal(Room *room, Player *p, int amount)
     if (!room || !p || amount <= 0 || p->hp <= 0 || p->hp >= p->max_hp) return;
     reason = numeric_reason_for_heal(p->hp, p->max_hp);
     snprintf(ctx, sizeof(ctx), "heal:%d:%d:%d:%d", room->id, p->id, amount, p->hp);
-    status = numeric_review("heal", ctx, reason, p->hp, p->hp + amount, &final_hp);
+    status = numeric_review("heal", ctx, reason, p->hp, p->hp + amount,
+                            room->difficulty, &final_hp);
     if (final_hp > p->max_hp) final_hp = p->max_hp;
     p->hp = final_hp;
     p->numeric_status = status;
@@ -1844,7 +2034,8 @@ static int ai_try_declare_death(Room *room)
     int i;
     int candidates[MAX_WARNINGS];
     int cc = 0;
-    int death_chance = 70;
+    static const int death_base[] = { 40, 60, 70, 80, 90 };
+    int death_chance = death_base[room->difficulty];
     const char *env_chance = getenv("LUANSHA_AI_DEATH_CHANCE");
 
     if (!room || room->status != ROOM_PLAYING || room->player_count == 0) return 0;
@@ -2103,6 +2294,7 @@ int game_room_to_json_ex(int room_id, const char *token, JsonBuf *out, int proce
             jsonb_appendf(out, ",\"damage\":%d", n->damage);
             jsonb_appendf(out, ",\"calamity\":%s", n->calamity ? "true" : "false");
             jsonb_appendf(out, ",\"notice\":%s", n->notice ? "true" : "false");
+            jsonb_appendf(out, ",\"green\":%s", n->green ? "true" : "false");
             jsonb_appendf(out, ",\"roll_used\":%s", n->roll_used ? "true" : "false");
             jsonb_appendf(out, ",\"roll_value\":%d", n->roll_value);
             jsonb_appendf(out, ",\"roll_chance\":%d", n->roll_chance);

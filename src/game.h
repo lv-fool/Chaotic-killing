@@ -34,6 +34,8 @@ typedef struct Player {
     int calamity;           /* 灾祸值：不合理发言增加，合理发言减少 */
     int next_turn_penalty;  /* 下回合限制：0=无，1=无法攻击，2=无法移动，3=跳过下回合，4=随机行动 */
     int rescue_streak;      /* 连续成功自救次数，用于惩罚连续秒解 */
+    int curse_turns;        /* 命运诅咒剩余回合数，>0 时幸运降低 */
+    int life_curse_turns;   /* 生命诅咒剩余回合数，>0 时每回合损失1点生命 */
     char ai_history[AI_HISTORY_MAX][AI_HISTORY_MSG_LEN]; /* AI 独立对话历史 */
     int ai_history_count;
 } Player;
@@ -50,6 +52,7 @@ typedef struct Narrative {
     int damage;         /* 0 = no damage, 1-3 = damage dealt */
     int calamity;       /* 1 = 灾祸降临事件（前端标红展示），0 = 普通叙事 */
     int notice;         /* 1 = 系统提示（前端标紫展示），0 = 普通叙事 */
+    int green;          /* 1 = 绿色系统提示（如恢复神智），0 = 普通叙事 */
     int roll_used;      /* 1 if a random check was performed */
     int roll_value;     /* 1..100 dice result */
     int roll_chance;    /* success threshold after weights */

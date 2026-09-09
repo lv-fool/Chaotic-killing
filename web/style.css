@@ -260,6 +260,12 @@ button.primary:hover {
   color: #e1b6ff;
 }
 
+.narrative-item.notice-green {
+  border-left-color: #4caf50;
+  background: #1f3a2a;
+  color: #b6ffd1;
+}
+
 .narrative-item.roll-success {
   border-left-color: #4caf7d;
 }

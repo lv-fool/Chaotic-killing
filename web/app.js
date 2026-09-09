@@ -499,7 +499,7 @@ function renderHeader(room) {
         <span>房间ID：${room.room_id}</span>
         <span class="status-badge">${statusNames[room.status] || room.status}</span>
         <span class="status-badge">${room.mode === 1 ? 'GM模式' : '自动判定'}</span>
-        <span class="status-badge">${room.difficulty ? '困难' : '普通'}</span>
+        <span class="status-badge">${['休闲','普通','困难','噩梦','地狱'][room.difficulty] || '普通'}</span>
         <span class="status-badge">第 ${room.round || 0} 轮</span>
         ${ownerText ? `<span class="status-badge">${escaped(ownerText)}</span>` : ''}
       </div>
@@ -576,7 +576,7 @@ function renderNarratives(room) {
     return;
   }
   $('narrative-list').innerHTML = room.narratives.map(n => `
-    <div class="narrative-item${n.calamity ? ' calamity' : ''}${n.notice ? ' notice' : ''}${n.roll_used ? (n.roll_success ? ' roll-success' : ' roll-fail') : ''}">
+    <div class="narrative-item${n.calamity ? ' calamity' : ''}${n.notice ? ' notice' : ''}${n.green ? ' notice-green' : ''}${n.roll_used ? (n.roll_success ? ' roll-success' : ' roll-fail') : ''}">
       <div class="meta">第${n.round}轮 · ${escaped(n.player_name)} · ${escaped(n.operation)}</div>
       <div>${escaped(n.content)}</div>
       ${n.roll_used ? `<div class="meta roll-meta">🎲 ${escaped(n.roll_note)}</div>` : ''}
