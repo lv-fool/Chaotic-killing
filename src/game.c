@@ -101,13 +101,14 @@ static int numeric_d100(unsigned long seed)
 
 static void numeric_audit_log(const char *op, const char *context,
                               NumericReason reason, int roll, int threshold,
-                              int pass, int current, int final_value)
+                              int pass, int current, int final_value,
+                              int difficulty)
 {
     FILE *f = fopen(NUMERIC_AUDIT_LOG, "a");
     if (!f) return;
-    fprintf(f, "op=%s ctx=%s reason=%d roll=%d threshold=%d pass=%d current=%d final=%d\n",
+    fprintf(f, "op=%s ctx=%s reason=%d roll=%d threshold=%d pass=%d current=%d final=%d diff=%d\n",
             op ? op : "?", context ? context : "?", (int)reason,
-            roll, threshold, pass, current, final_value);
+            roll, threshold, pass, current, final_value, difficulty);
     fclose(f);
 }
 
@@ -119,6 +120,8 @@ static int numeric_review(const char *op, const char *context,
     static const int high_threshold[] = { 95, 90, 85, 80, 75 };
     static const int med_threshold[]  = { 70, 60, 55, 50, 45 };
     static const int low_threshold[]  = { 50, 30, 25, 20, 15 };
+    /* 治疗比伤害更该被鼓励：给治疗判定一个固定的成功率加成。 */
+    static const int heal_bonus = 10;
     int threshold;
     int roll;
     int pass;
@@ -135,6 +138,12 @@ static int numeric_review(const char *op, const char *context,
     else if (reason == NUMERIC_REASON_MEDIUM) threshold = med_threshold[difficulty];
     else threshold = low_threshold[difficulty];
 
+    /* 治疗时提高通过阈值，让自救/救援更可行（仍受难度制约）。 */
+    if (op && strcmp(op, "heal") == 0) {
+        threshold += heal_bonus;
+        if (threshold > 99) threshold = 99;
+    }
+
     roll = numeric_d100(numeric_hash(context));
     pass = roll <= threshold;
 
@@ -148,7 +157,8 @@ static int numeric_review(const char *op, const char *context,
     final = current + adjusted_delta;
     if (final < 0) final = 0;
 
-    numeric_audit_log(op, context, reason, roll, threshold, pass, current, final);
+    numeric_audit_log(op, context, reason, roll, threshold, pass, current, final,
+                      difficulty);
     *final_value = final;
     return pass ? 0 : 1;
 }
