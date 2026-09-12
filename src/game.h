@@ -104,6 +104,7 @@ typedef struct Room {
     PendingJudgment pending_judgments[MAX_NARRATIVES];
     int pending_judgment_count;
     LimitState limit;
+    int ai_pending;         /* 后台 worker 待处理的 AI 动作标记（由轮询/发言接口置位） */
     int winner_id;
     int owner_id;
     char judge_log[4096];   /* 对局审核独立对话所需的全场记录 */
@@ -140,5 +141,8 @@ const char *game_op_name(int op);
 
 /* Reset for tests */
 void game_init(void);
+
+/* 后台 AI 工作线程：把 LLM 调用移出 HTTP 轮询线程（见 game.c）。 */
+void game_ai_worker_start(void);
 
 #endif /* GAME_H */

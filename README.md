@@ -36,6 +36,20 @@ http://localhost:8080
 - 默认端口：`8080`
 - `--no-open`：不自动打开浏览器
 
+### 桌面客户端
+
+也可以直接使用桌面客户端（基于 pywebview）：
+
+```text
+dist/luansha_client_py.exe
+```
+
+客户端会自动启动本地 `luansha.exe --no-open 8080` 并打开游戏窗口，无需手动开浏览器。
+
+- 需要把 `luansha_client_py.exe`、`luansha.exe`、`cloudflared.exe` 放在同一目录（`dist/` 已默认放好）；
+- 客户端界面提供“退出游戏”按钮，会真正退出客户端；
+- 浏览器模式仍然可用，二者互不影响。
+
 ## 怎么玩
 
 1. 创建或加入房间；
@@ -108,6 +122,26 @@ LUANSHA_AI_KEY="sk-xxx"
 
 配置会保存到 `luansha_ai.conf`，重启后仍生效。未配置 Key 时，系统会使用基础规则自动判断。
 
+## 公网联机
+
+使用桌面客户端可以一键开启 Cloudflare 免费隧道：
+
+1. 在客户端大厅点击“🌐 开启公网联机”；
+2. 等待生成 `https://xxx.trycloudflare.com` 公网地址；
+3. 把地址复制给朋友，对方用浏览器打开即可加入你的房间。
+
+- 需要 `dist/cloudflared.exe` 与客户端放在同一目录；
+- 免费地址每次开启会变化，适合熟人临时联机；
+- 如果网络到 Cloudflare 不稳定，后续计划支持 cpolar / ngrok / Tailscale 等备选方案。
+
+## 历史战绩 / 回放
+
+- 每局对局结束后，系统会自动把完整时间线保存到 `records/room_<房间ID>.json`；
+- 在大厅点击“📜 历史战绩”可以查看历史对局列表；
+- 点击“查看回放”可以浏览该局的完整叙事链、玩家状态与胜者。
+
+
+
 ## 开发者信息
 
 ### 常用环境变量
@@ -139,6 +173,8 @@ LUANSHA_AI_KEY="sk-xxx"
 | POST | `/api/game/declare_death` | 宣告死亡 |
 | POST | `/api/ai/config` | 保存 AI 配置 |
 | POST | `/api/ai/test` | 测试 AI 接口 |
+| GET | `/api/records` | 历史战绩列表 |
+| GET | `/api/records?id=<房间ID>` | 查看单局回放 |
 
 ## 目录结构
 
@@ -151,14 +187,23 @@ src/
   ai.c          AI 请求与生成
   ai.h          AI 接口声明
   json.c/json.h JSON 解析与序列化
-  web_assets.c  前端嵌入资源
+  web_assets.c  前端嵌入资源（由 tools/gen_web_assets.pl 生成）
 web/
   index.html    页面结构
   style.css     样式
   app.js        前端逻辑
+client/
+  py/client.py  pywebview 桌面客户端
+  win/          WebView2 旧版客户端（已弃用）
 tools/
   gen_web_assets.pl  前端资源生成脚本
   sim_ai_stats.js    模拟统计脚本
+dist/
+  luansha.exe          游戏服务器/网页服务（发布版）
+  luansha_client_py.exe 桌面客户端（发布版）
+  cloudflared.exe      公网隧道组件（发布版）
+records/
+  对局结束自动保存的回放文件（运行时生成）
 ```
 
 ## 提示
@@ -214,4 +259,5 @@ tools/
 - 更多场景与道具；
 - 更丰富的灾厄事件；
 - 道具赛模式；
-- 战绩与排行。
+- 账号体系与跨设备战绩同步（当前回放/战绩为本地保存）；
+- 自定义公网穿透（cpolar / ngrok / Tailscale）。

@@ -48,6 +48,7 @@ int main(int argc, char **argv)
     debug_log_init();
     game_init();
     ai_init();   /* 读取 ./luansha_ai.conf（若存在），运行时/文件配置优先于环境变量 */
+    game_ai_worker_start();  /* 后台 AI 工作线程：LLM 调用不再阻塞 HTTP 轮询 */
 
     printf("[AI] URL=%s\n", ai_get_url() ? ai_get_url() : "(default)");
     printf("[AI] MODEL=%s\n", ai_get_model() ? ai_get_model() : "(default)");

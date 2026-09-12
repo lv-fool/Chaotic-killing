@@ -14,6 +14,7 @@
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #include <shellapi.h>
+  #include <io.h>
   #ifdef _MSC_VER
     #pragma comment(lib, "ws2_32.lib")
     #pragma comment(lib, "shell32.lib")
@@ -27,6 +28,8 @@
   #include <arpa/inet.h>
   #include <unistd.h>
   #include <fcntl.h>
+  #include <dirent.h>
+  #include <sys/stat.h>
   typedef int socket_t;
   #define INVALID_SOCK (-1)
   #define CLOSE_SOCKET(s) close(s)
@@ -420,6 +423,145 @@ static int read_request(socket_t client, HttpRequest *req)
 }
 
 /* ------------------------------------------------------------------ */
+/* 对局回放/战绩 API 辅助                                                */
+/* ------------------------------------------------------------------ */
+
+static char *read_file_alloc(const char *path, size_t *out_len)
+{
+    FILE *f = fopen(path, "rb");
+    long sz;
+    char *buf;
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    sz = ftell(f);
+    if (sz < 0) { fclose(f); return NULL; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    if (sz > 0 && fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        free(buf);
+        fclose(f);
+        return NULL;
+    }
+    buf[sz] = '\0';
+    if (out_len) *out_len = (size_t)sz;
+    fclose(f);
+    return buf;
+}
+
+static void append_record_summary(JsonBuf *out, const char *path)
+{
+    char *text = read_file_alloc(path, NULL);
+    JsonValue *v;
+    JsonValue *players, *narratives;
+    int record_id, room_id, difficulty, winner_id, player_count, narrative_count;
+    const char *name, *created_at, *winner_name = "";
+    int i;
+
+    if (!text) return;
+    v = json_parse(text);
+    free(text);
+    if (!v) return;
+
+    record_id = json_get_int(v, "record_id", 0);
+    room_id = json_get_int(v, "room_id", 0);
+    name = json_get_string(v, "name", "");
+    difficulty = json_get_int(v, "difficulty", 0);
+    winner_id = json_get_int(v, "winner_id", 0);
+    created_at = json_get_string(v, "created_at", "");
+    players = json_get(v, "players");
+    narratives = json_get(v, "narratives");
+    player_count = players && players->type == JSON_ARRAY ? players->count : 0;
+    narrative_count = narratives && narratives->type == JSON_ARRAY ? narratives->count : 0;
+    if (players && players->type == JSON_ARRAY) {
+        for (i = 0; i < players->count; i++) {
+            JsonValue *p = players->items[i];
+            if (p && p->type == JSON_OBJECT && json_get_int(p, "id", 0) == winner_id) {
+                winner_name = json_get_string(p, "name", "");
+                break;
+            }
+        }
+    }
+
+    jsonb_append(out, "{");
+    jsonb_appendf(out, "\"record_id\":%d,", record_id);
+    jsonb_appendf(out, "\"room_id\":%d,", room_id);
+    jsonb_append(out, "\"name\":");
+    jsonb_string(out, name);
+    jsonb_appendf(out, ",\"difficulty\":%d,", difficulty);
+    jsonb_appendf(out, "\"winner_id\":%d,", winner_id);
+    jsonb_append(out, "\"winner_name\":");
+    jsonb_string(out, winner_name);
+    jsonb_append(out, ",");
+    jsonb_append(out, "\"created_at\":");
+    jsonb_string(out, created_at);
+    jsonb_appendf(out, ",\"player_count\":%d,", player_count);
+    jsonb_appendf(out, "\"narrative_count\":%d", narrative_count);
+    jsonb_append(out, "}");
+    json_free(v);
+}
+
+static void send_records_list(socket_t client)
+{
+    JsonBuf b;
+    int first = 1;
+    jsonb_init(&b);
+    jsonb_append(&b, "{\"ok\":true,\"records\":[");
+#ifdef _WIN32
+    {
+        struct _finddata_t fd;
+        intptr_t h = _findfirst("records/*.json", &fd);
+        if (h != -1) {
+            do {
+                char path[WEB_PATH_MAX];
+                snprintf(path, sizeof(path), "records/%s", fd.name);
+                if (!first) jsonb_append(&b, ",");
+                append_record_summary(&b, path);
+                first = 0;
+            } while (_findnext(h, &fd) == 0);
+            _findclose(h);
+        }
+    }
+#else
+    {
+        DIR *d = opendir("records");
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                size_t n = strlen(e->d_name);
+                if (n > 5 && strcmp(e->d_name + n - 5, ".json") == 0) {
+                    char path[WEB_PATH_MAX];
+                    snprintf(path, sizeof(path), "records/%s", e->d_name);
+                    if (!first) jsonb_append(&b, ",");
+                    append_record_summary(&b, path);
+                    first = 0;
+                }
+            }
+            closedir(d);
+        }
+    }
+#endif
+    jsonb_append(&b, "]}");
+    send_json(client, &b);
+    jsonb_free(&b);
+}
+
+static void send_record_detail(socket_t client, int record_id)
+{
+    char path[WEB_PATH_MAX];
+    char *text;
+    snprintf(path, sizeof(path), "records/room_%d.json", record_id);
+    text = read_file_alloc(path, NULL);
+    if (!text) {
+        send_error_json(client, "Record not found");
+        return;
+    }
+    http_response(client, 200, "application/json; charset=utf-8", text);
+    free(text);
+}
+
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
 /* API handlers                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -711,6 +853,17 @@ static void handle_api(socket_t client, HttpRequest *req)
         if (query_param(q, "room_id", value, sizeof(value))) room_id = atoi(value);
         query_param(q, "token", token, sizeof(token));
         send_state_processed(client, room_id, token);
+        return;
+    }
+
+    if (strcmp(path, "/api/records") == 0 && strcmp(req->method, "GET") == 0) {
+        const char *q = req->query;
+        char value[64];
+        if (query_param(q, "id", value, sizeof(value))) {
+            send_record_detail(client, atoi(value));
+        } else {
+            send_records_list(client);
+        }
         return;
     }
 

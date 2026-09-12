@@ -8,6 +8,11 @@ import urllib.request
 PORT = 8080
 URL = f"http://127.0.0.1:{PORT}"
 
+# 本机探活必须直连，绕开系统/环境代理。
+# 否则 http_proxy 一旦存在，127.0.0.1 的请求会被代理拦截成 5xx，
+# 服务器明明起来了却一直判定为「启动超时」。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 def base_dir():
     if getattr(sys, "frozen", False):
@@ -36,7 +41,7 @@ def wait_server(timeout=15):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            urllib.request.urlopen(URL, timeout=1)
+            _OPENER.open(URL, timeout=1)
             return True
         except Exception:
             time.sleep(0.3)
@@ -123,7 +128,14 @@ def main():
     proc = start_server()
     try:
         if not wait_server():
-            raise RuntimeError("服务器启动超时，请检查端口 8080 是否被占用。")
+            # 服务端子进程已经退出 → 基本可以断定是端口没抢到（luansha.exe 会打印 bind failed）。
+            # 分开报错，避免把「端口被占用」误导成「启动慢」。
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"服务器没能启动：端口 {PORT} 已被其他程序占用。\n"
+                    f"请关闭占用该端口的程序后重试（可在命令行执行 netstat -ano | findstr :{PORT} 查看占用者）。"
+                )
+            raise RuntimeError(f"服务器启动超时，请检查端口 {PORT} 是否被占用。")
         import webview
         api = Api()
         webview.create_window("乱杀跑团客户端", URL, width=1024, height=720, js_api=api)

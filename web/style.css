@@ -206,6 +206,32 @@ button.primary:hover {
   color: #aaa;
 }
 
+/* 灾祸档位：平静 / 躁动 / 危险。言之有物的叙述会把它压下去。 */
+.player-card .calamity-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: #3f3f66;
+  color: #cfd8ff;
+}
+
+.player-card .calamity-tag.cal-calm {
+  background: #2f4a6b;
+  color: #d6e9ff;
+}
+
+.player-card .calamity-tag.cal-uneasy {
+  background: #5b3a86;
+  color: #ecdcff;
+}
+
+.player-card .calamity-tag.cal-danger {
+  background: #8a1f4f;
+  color: #ffd9ec;
+}
+
 .limit-banner {
   background: #4a3a2a;
   border-radius: 10px;
@@ -353,4 +379,83 @@ button.primary:hover {
 
 .modal .form-row {
   margin: 10px 0;
+}
+
+
+/* 历史战绩 / 回放 */
+.records-panel {
+  margin-top: 12px;
+  border-top: 1px solid #3a3a55;
+  padding-top: 10px;
+}
+
+.records-panel h3 {
+  margin: 0 0 8px;
+  color: #ffd166;
+}
+
+.record-card {
+  background: #1e1e32;
+  border: 1px solid #3a3a55;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 8px 0;
+}
+
+.record-card button {
+  margin-top: 6px;
+}
+
+.record-players {
+  margin: 6px 0;
+}
+
+.record-players span {
+  display: inline-block;
+  background: #1b1b2a;
+  border: 1px solid #444466;
+  border-radius: 999px;
+  padding: 2px 10px;
+  margin: 2px 4px 2px 0;
+}
+
+.record-dead {
+  color: #ff6b6b;
+  text-decoration: line-through;
+}
+
+.record-narratives {
+  margin-top: 8px;
+  max-height: 60vh;
+  overflow-y: auto;
+  border: 1px solid #33334d;
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.record-narrative {
+  padding: 5px 6px;
+  border-bottom: 1px solid #2a2a44;
+}
+
+.record-narrative.calamity {
+  color: #ff6b6b;
+}
+
+.record-narrative.notice {
+  color: #c77dff;
+}
+
+.record-narrative.green {
+  color: #7dffa8;
+}
+
+.record-round {
+  color: #9999b0;
+  margin-right: 4px;
+}
+
+.record-op {
+  color: #ffd166;
+  margin: 0 4px;
 }

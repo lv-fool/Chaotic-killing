@@ -7,13 +7,27 @@
 #include <time.h>
 #include <stdarg.h>
 
+#ifdef _WIN32
+  #include <windows.h>
+  #include <direct.h>
+#else
+  #include <sys/stat.h>
+#endif
+
 #define DEFAULT_MAX_HP 6
 
-/* 灾祸值机制：不合理发言累积灾祸，达到阈值后每步有概率触发灾祸并清零。 */
+/* 灾祸值机制：不合理发言累积灾祸，达到阈值后每步有概率触发灾祸并清零。
+   灾祸是可逆的——言之有物的叙述会消解灾祸，因此它是「可管理」的资源，
+   而不是对活跃玩家的单向惩罚。 */
 #define CALAMITY_THRESHOLD 5
 #define CALAMITY_CHANCE_LOW   20   /* 灾祸值 5-9 */
 #define CALAMITY_CHANCE_MED   40   /* 灾祸值 10-14 */
 #define CALAMITY_CHANCE_HIGH  60   /* 灾祸值 >=15 */
+#define CALAMITY_RELIEF        2   /* 一次高质量发言消解的灾祸值 */
+
+/* 灾祸值的可见档位：0=平静，1=躁动，2=危险（前端只暴露档位，不暴露具体数值）。 */
+#define CALAMITY_TIER_UNEASY   CALAMITY_THRESHOLD      /* >=5 躁动 */
+#define CALAMITY_TIER_DANGER   10                      /* >=10 危险 */
 
 Room g_rooms[MAX_ROOMS];
 int g_room_count = 0;
@@ -79,43 +93,36 @@ typedef enum NumericReason {
     NUMERIC_REASON_HIGH = 2
 } NumericReason;
 
-static unsigned long numeric_hash(const char *s)
-{
-    unsigned long h = 2166136261UL;
-    if (!s) return h;
-    while (*s) {
-        h ^= (unsigned char)*s++;
-        h *= 16777619UL;
-    }
-    return h;
-}
-
+/* 判定骰子：直接使用 rand()（game_init 已 srand(time)）。
+ * 上级实现用 FNV-1a 哈希 % 100 做"确定性随机"，导致：
+ *   1) 相同判定上下文（房间/攻击方/目标/伤害/血量一致）必然复现同一结果；
+ *   2) 32 位哈希取模存在明显低位偏置（审计日志中 98/15 等点数频繁出现）。
+ */
 static int numeric_d100(unsigned long seed)
 {
-    unsigned long x = seed ? seed : 1;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    return (int)(x % 100) + 1;
+    (void)seed;
+    return rand() % 100 + 1;
 }
 
 static void numeric_audit_log(const char *op, const char *context,
                               NumericReason reason, int roll, int threshold,
                               int pass, int current, int final_value,
-                              int difficulty)
+                              int difficulty, int room_id, int round)
 {
     FILE *f = fopen(NUMERIC_AUDIT_LOG, "a");
     if (!f) return;
-    fprintf(f, "op=%s ctx=%s reason=%d roll=%d threshold=%d pass=%d current=%d final=%d diff=%d\n",
+    fprintf(f, "op=%s ctx=%s reason=%d roll=%d threshold=%d pass=%d current=%d final=%d diff=%d room=%d round=%d\n",
             op ? op : "?", context ? context : "?", (int)reason,
-            roll, threshold, pass, current, final_value, difficulty);
+            roll, threshold, pass, current, final_value, difficulty,
+            room_id, round);
     fclose(f);
 }
 
 /* 返回 0=按原操作生效，1=已调整 */
 static int numeric_review(const char *op, const char *context,
                           NumericReason reason, int current, int proposed,
-                          int difficulty, int *final_value)
+                          int difficulty, int room_id, int round,
+                          int *final_value)
 {
     static const int high_threshold[] = { 95, 90, 85, 80, 75 };
     static const int med_threshold[]  = { 70, 60, 55, 50, 45 };
@@ -144,21 +151,27 @@ static int numeric_review(const char *op, const char *context,
         if (threshold > 99) threshold = 99;
     }
 
-    roll = numeric_d100(numeric_hash(context));
+    roll = numeric_d100(0);
     pass = roll <= threshold;
 
     delta = proposed - current;
     adjusted_delta = delta;
     if (!pass) {
-        /* 未通过时削减变化幅度，向 0 靠拢；最低限度为完全抵消。 */
-        if (delta > 0) adjusted_delta = delta / 2;
-        else if (delta < 0) adjusted_delta = -((-delta) / 2);
+        /* 治疗失败 = 完全无效（不再折半保底）。
+         * 否则会出现"1↔3 HP 反复横跳、战斗永远打不死"的循环。 */
+        if (op && strcmp(op, "heal") == 0) {
+            adjusted_delta = 0;
+        } else if (delta > 0) {
+            adjusted_delta = delta / 2;
+        } else if (delta < 0) {
+            adjusted_delta = -((-delta) / 2);
+        }
     }
     final = current + adjusted_delta;
     if (final < 0) final = 0;
 
     numeric_audit_log(op, context, reason, roll, threshold, pass, current, final,
-                      difficulty);
+                      difficulty, room_id, round);
     *final_value = final;
     return pass ? 0 : 1;
 }
@@ -182,7 +195,35 @@ static NumericReason numeric_reason_for_heal(int current_hp, int max_hp)
 /* 灾祸值：根据发言合理度增减。 */
 static int player_has_unresolved_warning(Room *room, int player_id);
 static void apply_damage(Room *room, int target_id, int damage, int source_id, int create_warning);
-static NumericReason sentence_reasonableness(const char *content, int operation)
+/* 叙述是否「言之有物」：借用了场景里的具体事物、做了具体动作、
+   或牵涉到其他玩家，才算有铺垫的扎实叙述。 */
+static int has_concrete_anchor(Room *room, const char *content)
+{
+    static const char *action_words[] = {
+        "踢", "砸", "抓", "推", "拉", "躲", "绕", "攀", "撬", "扔", "抛",
+        "拔", "挥", "捡", "拆", "堆", "堵", "掀", "钻", "翻", "爬", "踩",
+        "勾", "扯", "锁", "绑", "倒", "泼", "洒", "挡", "拽", "拖", "撞",
+        "压", "顶", "扫", "劈", "刺", "砍", "捅", "射", "割", "斩", "烧", "烫"
+    };
+    size_t i;
+    int j;
+
+    if (!content || !*content) return 0;
+    if (room) {
+        for (i = 0; i < (size_t)room->scene_item_total && i < MAX_SCENE_ITEMS; i++) {
+            if (room->scene_items[i][0] && strstr(content, room->scene_items[i])) return 1;
+        }
+        for (j = 0; j < room->player_count; j++) {
+            if (room->players[j].name[0] && strstr(content, room->players[j].name)) return 1;
+        }
+    }
+    for (i = 0; i < sizeof(action_words) / sizeof(action_words[0]); i++) {
+        if (strstr(content, action_words[i])) return 1;
+    }
+    return 0;
+}
+
+static NumericReason sentence_reasonableness(Room *room, const char *content, int operation)
 {
     static const char *bad_words[] = {
         "时间倒流", "黑洞", "影子", "数据化", "量子", "奇点",
@@ -203,7 +244,10 @@ static NumericReason sentence_reasonableness(const char *content, int operation)
         strstr(content, "保持沉默")) {
         return NUMERIC_REASON_LOW;
     }
-    if (operation == OP_TWIST || operation == OP_CREATE) return NUMERIC_REASON_HIGH;
+
+    /* 言之有物 → 高质量（消解灾祸）；空泛表态 → 中等质量（缓慢累积灾祸）。
+       注意：这里不再按「创造/扭曲」一刀切给高分，否则灾祸系统会被直接架空。 */
+    if (has_concrete_anchor(room, content)) return NUMERIC_REASON_HIGH;
     return NUMERIC_REASON_MEDIUM;
 }
 
@@ -211,7 +255,8 @@ static void adjust_calamity(Player *p, NumericReason reason)
 {
     if (!p) return;
     if (reason == NUMERIC_REASON_HIGH) {
-        /* 合理发言不会降低灾祸值，只是不再增加。 */
+        /* 高质量叙述消解灾祸：让灾祸成为可逆、可管理的资源。 */
+        p->calamity -= CALAMITY_RELIEF;
     } else if (reason == NUMERIC_REASON_MEDIUM) {
         p->calamity += 1;
     } else {
@@ -532,13 +577,52 @@ static int contains_conjunction(const char *s)
 {
     static const char *words[] = {
         "但是", "可是", "然而", "而且", "并且", "因为", "所以", "如果", "那么",
-        "虽然", "于是", "因此", "既然", "只要", "只有", "无论", "不管", "不仅",
-        "不但", "还", "却", "但"
+        "虽然", "于是", "因此", "既然", "只要", "只有", "无论", "不管", "不仅", "不但"
     };
     size_t i;
+    if (!s) return 0;
     for (i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
-        /* "但" is deliberately checked separately to avoid matching 但是 twice. */
         if (strstr(s, words[i])) return 1;
+    }
+    /* 单字连词（按 UTF-8 字节序列匹配，避免多字节字面量警告）：
+       必须满足词边界（句首或前接标点），否则会误伤词组内部，
+       例如"冷却液"里的"却"、"还有"里的"还"。 */
+    {
+        static const unsigned char single[2][3] = {
+            { 0xE5, 0x8D, 0xB4 },  /* 却 */
+            { 0xE4, 0xBD, 0x86 }   /* 但 */
+        };
+        size_t si;
+        for (si = 0; si < sizeof(single) / sizeof(single[0]); si++) {
+            const char *q = s;
+            while ((q = (const char *)memchr((const void *)q, single[si][0], strlen(q))) != NULL) {
+                if ((unsigned char)q[1] == single[si][1] &&
+                    (unsigned char)q[2] == single[si][2]) {
+                    int boundary;
+                    if (q == s) {
+                        boundary = 1;
+                    } else {
+                        const unsigned char b1 = (unsigned char)q[-1];
+                        if (b1 < 0x80) {
+                            /* 前一字符是 ASCII：标点/空白算边界，字母数字不算 */
+                            boundary = !(isalnum((int)b1) || b1 == '_');
+                        } else if (q - 3 >= s &&
+                                   (unsigned char)q[-3] == 0xE3 &&
+                                   (unsigned char)q[-2] == 0x80) {
+                            /* 前一字符是 CJK 标点（，。！？；、：等，E3 80 xx） */
+                            boundary = 1;
+                        } else {
+                            /* 前一字符是普通汉字/其他多字节字符 → 词组内部 */
+                            boundary = 0;
+                        }
+                    }
+                    if (boundary) return 1;
+                    q += 3;
+                } else {
+                    q++;
+                }
+            }
+        }
     }
     return 0;
 }
@@ -609,6 +693,83 @@ static int heuristic_damage(const char *s, int operation)
     return 0;
 }
 
+/* 威胁→濒死警告的转化概率：随受害者当前血量递减。
+ * HP 越高，抵抗濒死的能力越强——除非被打到残血，否则单纯的"威胁"
+ * 只会造成伤害，而不会必然变成濒死警告。 */
+static int warning_chance_from_hp(int hp)
+{
+    if (hp <= 1) return 100;
+    if (hp == 2) return 75;
+    if (hp == 3) return 55;
+    if (hp == 4) return 40;
+    if (hp == 5) return 25;
+    return 15;
+}
+
+/* UTF-8 字符宽度：返回首个字符占用的字节数（1~4；孤立续字节按 1 处理）。 */
+static size_t utf8_char_len(const char *p)
+{
+    unsigned char c;
+    if (!p) return 0;
+    c = (unsigned char)p[0];
+    if (c < 0x80) return 1;
+    if (c >= 0xC0 && c <= 0xDF) return 2;
+    if (c >= 0xE0 && c <= 0xEF) return 3;
+    if (c >= 0xF0 && c <= 0xF7) return 4;
+    return 1;
+}
+
+/* 最长公共连续子串，按"字符"计数并且只在字符边界对齐。
+ * 注意不能按字节计数：5 个汉字("朝机房侧门")就是 15 字节，会把
+ * 正常语句误判成"复制"，之前因此误杀了一整局 AI 台词。 */
+static size_t longest_common_span(const char *a, const char *b)
+{
+    size_t i, j, best = 0;
+    if (!a || !b) return 0;
+    for (i = 0; a[i]; i += utf8_char_len(a + i)) {
+        for (j = 0; b[j]; j += utf8_char_len(b + j)) {
+            size_t k = 0;
+            size_t ck = 0;
+            while (a[i + k] && b[j + k] && a[i + k] == b[j + k]) {
+                size_t w = utf8_char_len(a + i + k);
+                k += w;
+                ck++;
+            }
+            if (ck > best) best = ck;
+        }
+    }
+    return best;
+}
+
+/* 防复制：只与"最近 2 名其他玩家"的发言比对，
+ * 公共片段 >= 14 字且占较短一句的 60% 以上才算复制。
+ * 不比对系统叙事，也不比对玩家自己的历史（自己的惯用句不算抄袭）。 */
+static int sentence_too_similar(const char *content, Room *room, int self_id)
+{
+    int i;
+    int scanned = 0;
+    size_t clen = 0;
+    size_t j;
+    if (!content || !*content || !room) return 0;
+    for (j = 0; content[j]; j += utf8_char_len(content + j)) clen++;
+    for (i = room->narrative_count - 1; i >= 0 && scanned < 2; i--) {
+        const char *other;
+        size_t olen = 0;
+        size_t span;
+        if (room->narratives[i].player_id <= 0 ||
+            room->narratives[i].player_id == self_id) {
+            continue;
+        }
+        other = room->narratives[i].content;
+        for (j = 0; other[j]; j += utf8_char_len(other + j)) olen++;
+        if (olen < 12 || clen < 12) continue;
+        scanned++;
+        span = longest_common_span(content, other);
+        if (span >= 14 && span * 10 >= (olen < clen ? olen : clen) * 6) return 1;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Random determination model                                          */
 /*                                                                     */
@@ -619,17 +780,27 @@ static int heuristic_damage(const char *s, int operation)
 /*   + operation weight                                                */
 /*   + luck compensation (previous failure)                            */
 /* clamped to [ROLL_MIN, ROLL_MAX]; d100 <= chance means success.      */
+/*                                                                     */
+/* 配平原则：叙述质量（合理性 + 铺垫）的权重必须显著高于难度偏移，     */
+/* 且 BASE 要留出足够的地板/天花板空间，否则质量信号会被 clamp 吃掉。  */
+/* 难度决定的是「地板」，说得有多好决定的是「你在自己这一档能走多高」。*/
 /* ------------------------------------------------------------------ */
-#define ROLL_BASE        75
-#define ROLL_W_DIFF      12
-#define ROLL_W_PLAUSIBLE  8
-#define ROLL_W_PREPARED   6
+#define ROLL_BASE        55
+#define ROLL_W_DIFF       8
+#define ROLL_W_PLAUSIBLE 14
+#define ROLL_W_PREPARED  10
 #define ROLL_LUCK_BONUS   8
 #define ROLL_MIN          5
 #define ROLL_MAX         95
 
 /* 难度对随机判定成功率的偏移：休闲/普通/困难/噩梦/地狱 */
 static const int difficulty_chance_bonus[] = { 10, 0, -10, -20, -30 };
+
+/* 叙述质量对伤害的增益（百分比）：合理性/铺垫越好，伤害越足。 */
+#define DAMAGE_QUALITY_W_PLAUSIBLE  12
+#define DAMAGE_QUALITY_W_PREPARED   10
+#define DAMAGE_QUALITY_MAX          50
+#define DAMAGE_QUALITY_MIN         -50
 
 static int operation_roll_weight(int operation)
 {
@@ -775,6 +946,116 @@ static int process_one_pending_ai_action(Room *room)
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* 后台 AI 工作线程                                                      */
+/* 把 LLM 调用（含 curl 重试）移出 HTTP 轮询线程：轮询/发言接口只负责    */
+/* 短事务（置位 + 序列化），AI 对局推进由 worker 在房间级锁内执行，      */
+/* 避免"一个房间的 AI 卡顿阻塞所有房间"。                                */
+/* 每个房间一把锁（放在与 Room 平行的数组中，避免被 create 的 memset    */
+/* 清掉）。实现依赖 Windows CRITICAL_SECTION；非 Windows 编译为无锁      */
+/* 退化（保持单进程原行为）。                                           */
+/* ------------------------------------------------------------------ */
+#ifdef _WIN32
+static CRITICAL_SECTION g_rlock[MAX_ROOMS];
+static HANDLE g_ai_worker_handles[MAX_ROOMS];
+static volatile LONG g_ai_worker_alive = 0;
+#endif
+
+static void room_lock(Room *room)
+{
+#ifdef _WIN32
+    if (!room) return;
+    {
+        long idx = room - g_rooms;
+        if (idx >= 0 && idx < MAX_ROOMS) EnterCriticalSection(&g_rlock[idx]);
+    }
+#endif
+}
+
+static void room_unlock(Room *room)
+{
+#ifdef _WIN32
+    if (!room) return;
+    {
+        long idx = room - g_rooms;
+        if (idx >= 0 && idx < MAX_ROOMS) LeaveCriticalSection(&g_rlock[idx]);
+    }
+#endif
+}
+
+#ifdef _WIN32
+/* 每房间独立 worker：该线程只服务一个房间，A 房 LLM 卡顿时不会阻塞 B 房。 */
+static DWORD WINAPI ai_worker_room_main(void *arg)
+{
+    Room *room = (Room *)arg;
+    while (g_ai_worker_alive) {
+        if (!room || room->status != ROOM_PLAYING) break;
+        if (room->ai_pending) {
+            room->ai_pending = 0;
+            room_lock(room);
+            {
+                int steps = 0;
+                /* 单次最多推进 8 个动作，避免长时间独占锁；随后会让出锁睡眠。 */
+                while (steps++ < 8 && process_one_pending_ai_action(room)) {
+                    /* continue */
+                }
+            }
+            room_unlock(room);
+        }
+        Sleep(10);
+    }
+    return 0;
+}
+
+static void ai_worker_ensure(Room *room)
+{
+    long idx;
+    DWORD st;
+    HANDLE h;
+
+    if (!room) return;
+    idx = room - g_rooms;
+    if (idx < 0 || idx >= MAX_ROOMS) return;
+
+    h = g_ai_worker_handles[idx];
+    if (h) {
+        st = WaitForSingleObject(h, 0);
+        if (st == WAIT_OBJECT_0) {
+            /* 旧线程已退出（房间结束），关闭后为新房间重建。 */
+            CloseHandle(h);
+            h = NULL;
+        } else {
+            /* 该房间已有独立 worker 在跑，无需重复创建。 */
+            return;
+        }
+    }
+
+    h = CreateThread(NULL, 0, ai_worker_room_main, room, 0, NULL);
+    if (h) g_ai_worker_handles[idx] = h;
+}
+#endif
+
+/* 标记该房间有 AI 动作待处理（worker 会尽快消费）。 */
+static void ai_worker_kick(Room *room)
+{
+    if (!room) return;
+    room->ai_pending = 1;
+#ifdef _WIN32
+    ai_worker_ensure(room);
+#else
+    (void)0;
+#endif
+}
+
+void game_ai_worker_start(void)
+{
+#ifdef _WIN32
+    if (g_ai_worker_alive) return;
+    memset(g_ai_worker_handles, 0, sizeof(g_ai_worker_handles));
+    g_ai_worker_alive = 1;
+#endif
+}
+
 static void judge_log_append(Room *room, const char *line)
 {
     size_t used;
@@ -862,7 +1143,9 @@ static void ai_speak_current(Room *room)
     int roll_chance = 0;
     int roll_success = 1;
     char roll_note[128] = "";
+    char kept[MAX_CONTENT];   /* 复制判定退下时的第一版台词（重试失败时容忍回退） */
     content[0] = '\0';
+    kept[0] = '\0';
 
     if (!room || room->status != ROOM_PLAYING || room->player_count == 0) return;
     if (room->turn_index < 0 || room->turn_index >= room->player_count) return;
@@ -1034,7 +1317,64 @@ after_generation:
         content_ok = 0;
         content[0] = '\0';
     }
-    /* 语法/合理性审查：不合格时重新生成，最多重试 2 次。 */
+    /* 规则闸口：AI 与真人在"单句/连词/移动限制"上执行同一套本地硬校验。
+       命中后带原因重生成（硬规则仅重试 1 次，重试太多会加剧供应商限流）。 */
+    {
+        char reject_reason[256] = "";
+        int rejected = 0;
+
+        if (content_ok) {
+            if (count_terminal_punct(content) > 1 ||
+                contains_conjunction(content)) {
+                snprintf(reject_reason, sizeof(reject_reason),
+                         "台词必须是一句话，不能使用连词（如“但是/而且/同时”）或叠加多个动作");
+                rejected = 1;
+            } else if (p->next_turn_penalty == 2 && contains_move_marker(content)) {
+                snprintf(reject_reason, sizeof(reject_reason),
+                         "你本回合无法移动，动作必须留在原地");
+                rejected = 1;
+            }
+        }
+        if (rejected) {
+            debug_log("[ai_content_rejected] room=%d player=%s content=%s reason=%s",
+                      room->id, p->name, content[0] ? content : "(empty)", reject_reason);
+            if (gen_retry < 1) {
+                gen_retry++;
+                strncat(constraint, "；你上一次的发言被拒绝，原因是：",
+                        sizeof(constraint) - strlen(constraint) - 1);
+                strncat(constraint, reject_reason,
+                        sizeof(constraint) - strlen(constraint) - 1);
+                strncat(constraint, "。请重新生成一句新的、完全不同的合格发言。",
+                        sizeof(constraint) - strlen(constraint) - 1);
+                content_ok = 0;
+                content[0] = '\0';
+                goto retry_generate;
+            }
+            content_ok = 0;
+            content[0] = '\0';
+        }
+    }
+    /* 防复制：只与最近 2 名其他玩家比对（字符级、占较短句 60% 才算）。
+       命中：保存第一版 → 重试 1 次 → 重试失败时容忍第一版（避免"拒绝→
+       重试网络失败→模板"的死循环刷屏）。 */
+    if (content_ok && room->narrative_count > 0 &&
+        sentence_too_similar(content, room, p->id)) {
+        debug_log("[ai_content_rejected] room=%d player=%s content=%s reason=%s",
+                  room->id, p->name, content[0] ? content : "(empty)", "copycat");
+        if (gen_retry < 2) {
+            safe_copy(kept, sizeof(kept), content);
+            gen_retry++;
+            strncat(constraint,
+                    "；你上一次的发言与最近发言过于相似（不要重复或改写其他玩家刚说过的话）。请重新生成一句全新的内容。",
+                    sizeof(constraint) - strlen(constraint) - 1);
+            content_ok = 0;
+            content[0] = '\0';
+            goto retry_generate;
+        }
+        content_ok = 0;
+        content[0] = '\0';
+    }
+    /* 语法/合理性审查（LLM 加权）：不合格时重新生成，最多重试 2 次。 */
     if (content_ok) {
         char reject_reason[256];
         if (is_ai_content_bad(content, reject_reason, sizeof(reject_reason))) {
@@ -1073,6 +1413,15 @@ after_generation:
         content_ok = 0;
         content[0] = '\0';
         debug_log("[penalty] room=%d player=%s penalty=2 action=no_move", room->id, p->name);
+    }
+    /* 重试因网络失败而空手时：若保留的第一版已通过硬规则（仅因轻微相似被退回），
+       直接采用它，避免"拒绝→重试网络失败→模板"的死循环刷屏。 */
+    if (!content_ok && !attack_mode && kept[0]) {
+        safe_copy(content, sizeof(content), kept);
+        kept[0] = '\0';
+        content_ok = 1;
+        debug_log("[ai_similarity_tolerated] room=%d player=%s content=%s",
+                  room->id, p->name, content);
     }
     if (!content_ok) {
         if (attack_mode && attack_target_id > 0) {
@@ -1113,7 +1462,23 @@ after_generation:
     safe_copy(n->content, sizeof(n->content), content);
     safe_copy(n->limit_keyword, sizeof(n->limit_keyword),
               room->limit.keyword[0] ? room->limit.keyword : "");
-    n->target_id = attack_mode ? attack_target_id : 0;
+    /* 目标对齐：台词里点名了唯一一名存活玩家时，把"说打谁"和"打谁"对上，
+       避免出现"台词说要电死你、机制却什么都没做"的脱节。 */
+    if (attack_mode) {
+        n->target_id = attack_target_id;
+    } else {
+        int mcnt = 0;
+        int mtarget = 0;
+        n->target_id = 0;
+        for (i = 0; i < room->player_count; i++) {
+            if (room->players[i].id != p->id && room->players[i].alive &&
+                strstr(content, room->players[i].name)) {
+                mtarget = room->players[i].id;
+                mcnt++;
+            }
+        }
+        if (mcnt == 1) n->target_id = mtarget;
+    }
     /* AI 受命运诅咒时，攻击有概率效果打折（伤害减半）。 */
     if (attack_mode && attack_damage > 0 && p->curse_turns > 0 &&
         rand() % 100 < 50) {
@@ -1137,6 +1502,16 @@ after_generation:
                  roll_success ? "行动顺利推进。" : "行动没有完全达到预期。");
         if (!roll_success && attack_damage > 0) {
             attack_damage = attack_damage / 2;
+            if (attack_damage < 1) attack_damage = 1;
+        }
+    }
+    /* AI 攻击同样接入叙述质量倍率（与真人无 AI 路径一致），
+       保证"言之有物打得更狠"在人和 AI 两端同规则。 */
+    if (attack_mode && attack_damage > 0) {
+        NumericReason qr = sentence_reasonableness(room, content, op);
+        int pct = (qr == NUMERIC_REASON_HIGH) ? 20 : (qr == NUMERIC_REASON_LOW ? -30 : 0);
+        if (pct != 0) {
+            attack_damage = attack_damage * (100 + pct) / 100;
             if (attack_damage < 1) attack_damage = 1;
         }
     }
@@ -1182,7 +1557,7 @@ after_generation:
               attack_mode ? attack_damage : 0, content);
 
     /* 灾祸值：AI 发言同样按合理度增减，并尝试触发灾祸。 */
-    adjust_calamity(p, sentence_reasonableness(content, op));
+    adjust_calamity(p, sentence_reasonableness(room, content, op));
     try_trigger_calamity(room, p);
 
     /* 伤害结算：AI 攻击先扣血，死亡则不再额外创建濒死警告。 */
@@ -1194,7 +1569,8 @@ after_generation:
     if (attack_mode && attack_danger && attack_target_id > 0 &&
         room->warning_count < MAX_WARNINGS && room->status == ROOM_PLAYING) {
         int ti = player_by_id(room, attack_target_id);
-        if (ti >= 0 && room->players[ti].alive) {
+        if (ti >= 0 && room->players[ti].alive &&
+            rand() % 100 < warning_chance_from_hp(room->players[ti].hp)) {
             Warning *w = &room->warnings[room->warning_count];
             memset(w, 0, sizeof(*w));
             w->id = room->warning_count + 1;
@@ -1210,6 +1586,44 @@ after_generation:
             debug_log("[warning_create] room=%d victim=%d source=%d reason=%s",
                       room->id, attack_target_id, p->id, w->reason);
             room->warning_count++;
+        }
+    }
+
+    /* AI 的非攻击叙述（扭曲/创造）点名了唯一一名存活玩家时，也走与真人一致的
+       危险判定——否则会出现"台词说要杀你，机制却什么都没做"的脱节。 */
+    if (!attack_mode && (op == OP_TWIST || op == OP_CREATE) &&
+        room->status == ROOM_PLAYING && room->warning_count < MAX_WARNINGS) {
+        int mtarget = 0;
+        int mcnt = 0;
+        for (i = 0; i < room->player_count; i++) {
+            if (room->players[i].id != p->id && room->players[i].alive &&
+                strstr(content, room->players[i].name)) {
+                mtarget = room->players[i].id;
+                mcnt++;
+            }
+        }
+        if (mcnt == 1 && ai_is_configured() && ai_can_request_now()) {
+            int danger = 0;
+            char jreason[256] = "";
+            int vti = player_by_id(room, mtarget);
+            const char *tn = (vti >= 0) ? room->players[vti].name : "";
+            if (ai_try_judge_narration(room->name, players_text, p->name,
+                                       content, op, tn, &danger,
+                                       jreason, sizeof(jreason)) == 1 && danger &&
+                vti >= 0 &&
+                rand() % 100 < warning_chance_from_hp(room->players[vti].hp)) {
+                Warning *w = &room->warnings[room->warning_count];
+                memset(w, 0, sizeof(*w));
+                w->id = room->warning_count + 1;
+                w->victim_id = mtarget;
+                w->source_id = p->id;
+                w->narrative_id = n->id;
+                w->resolved = 0;
+                safe_copy(w->reason, sizeof(w->reason), jreason[0] ? jreason : content);
+                debug_log("[warning_create] room=%d victim=%d source=%d reason=%s",
+                          room->id, mtarget, p->id, w->reason);
+                room->warning_count++;
+            }
         }
     }
 
@@ -1254,7 +1668,7 @@ after_generation:
             if (rand() % 100 < rescue_chance) {
                 p->rescue_streak++;
                 resolve_victim_warnings(room, p->id);
-                apply_heal(room, p, 2);
+                apply_heal(room, p, 1);
             } else {
                 p->rescue_streak = 0;
             }
@@ -1317,6 +1731,12 @@ void game_init(void)
     g_room_count = 0;
     g_next_room_id = 1;
     srand((unsigned)time(NULL));
+#ifdef _WIN32
+    {
+        int i;
+        for (i = 0; i < MAX_ROOMS; i++) InitializeCriticalSection(&g_rlock[i]);
+    }
+#endif
 }
 
 Room *game_find_room(int room_id)
@@ -1338,7 +1758,7 @@ Player *game_find_player(Room *room, const char *token)
     return NULL;
 }
 
-int game_create_room(const char *room_name, int mode, int difficulty, const char *player_name, char *token_out)
+static int game_create_room_impl(const char *room_name, int mode, int difficulty, const char *player_name, char *token_out)
 {
     Room *room;
     int idx;
@@ -1377,7 +1797,7 @@ int game_create_room(const char *room_name, int mode, int difficulty, const char
     return room->id;
 }
 
-int game_join_room(int room_id, const char *player_name, char *token_out)
+static int game_join_room_impl(int room_id, const char *player_name, char *token_out)
 {
     Room *room = game_find_room(room_id);
     Player *p;
@@ -1405,7 +1825,7 @@ int game_join_room(int room_id, const char *player_name, char *token_out)
     return room->id;
 }
 
-int game_add_ai(int room_id)
+static int game_add_ai_impl(int room_id)
 {
     Room *room = game_find_room(room_id);
     Player *p;
@@ -1438,7 +1858,7 @@ int game_add_ai(int room_id)
     return room->id;
 }
 
-int game_set_ready(int room_id, const char *token, int ready)
+static int game_set_ready_impl(int room_id, const char *token, int ready)
 {
     Room *room = game_find_room(room_id);
     Player *p = room ? game_find_player(room, token) : NULL;
@@ -1477,7 +1897,7 @@ static void advance_to_next_alive(Room *room)
     }
 }
 
-int game_start(int room_id, const char *token, int fill_ai)
+static int game_start_impl(int room_id, const char *token, int fill_ai)
 {
     Room *room = game_find_room(room_id);
     Player *p = room ? game_find_player(room, token) : NULL;
@@ -1489,7 +1909,7 @@ int game_start(int room_id, const char *token, int fill_ai)
 
     if (fill_ai) {
         while (room->player_count < 4) {
-            int r = game_add_ai(room_id);
+            int r = game_add_ai_impl(room_id);
             if (r < 0) break;
         }
     }
@@ -1529,7 +1949,7 @@ int game_start(int room_id, const char *token, int fill_ai)
     return 0;
 }
 
-int game_speak(int room_id, const char *token, int operation, const char *content,
+static int game_speak_impl(int room_id, const char *token, int operation, const char *content,
                const char *limit_keyword, int target_id,
                char *error_msg, size_t error_size)
 {
@@ -1541,6 +1961,7 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
     int roll_value = 0;
     int roll_chance = 0;
     int roll_success = 1;
+    int quality_pct = 0;   /* 叙述质量对伤害的增益（百分比，-50..+50） */
     char roll_note[128] = "";
     char forced_content[MAX_CONTENT];
 
@@ -1653,6 +2074,13 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
             return -11;
         }
 
+        /* 叙述质量 → 伤害增益：合理性/铺垫直接作用到伤害上，
+           让「写得好」不只是过检，而是真的打得更狠。 */
+        quality_pct = (plausibility - 3) * DAMAGE_QUALITY_W_PLAUSIBLE +
+                      (preparation - 3) * DAMAGE_QUALITY_W_PREPARED;
+        if (quality_pct > DAMAGE_QUALITY_MAX) quality_pct = DAMAGE_QUALITY_MAX;
+        if (quality_pct < DAMAGE_QUALITY_MIN) quality_pct = DAMAGE_QUALITY_MIN;
+
         if (need_roll) {
             int luck = p->last_roll_failed ? ROLL_LUCK_BONUS : 0;
             roll_chance = compute_roll_chance(difficulty, plausibility, preparation,
@@ -1713,6 +2141,21 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
               room->limit.keyword[0] ? room->limit.keyword : (limit_keyword ? limit_keyword : ""));
     n->target_id = target_id;
     n->damage = heuristic_damage(content, operation);
+
+    /* 叙述质量 → 伤害倍率。
+       有 AI 裁判时，quality_pct 已由合理性/铺垫算出；
+       无 AI 时退回启发式：言之有物 +20%，空泛 -30%。 */
+    if (!ai_is_configured()) {
+        NumericReason qr = sentence_reasonableness(room, content, operation);
+        quality_pct = (qr == NUMERIC_REASON_HIGH) ? 20
+                    : (qr == NUMERIC_REASON_LOW ? -30 : 0);
+    }
+    if (n->damage > 0 && quality_pct != 0) {
+        int qd = n->damage * (100 + quality_pct) / 100;
+        if (qd < 1) qd = 1;
+        n->damage = qd;
+    }
+
     n->roll_used = roll_used;
     n->roll_value = roll_value;
     n->roll_chance = roll_chance;
@@ -1751,7 +2194,7 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
               room->id, p->name, operation, target_id, content);
 
     /* 灾祸值：根据发言合理度增减，并尝试触发灾祸。 */
-    adjust_calamity(p, sentence_reasonableness(content, operation));
+    adjust_calamity(p, sentence_reasonableness(room, content, operation));
     try_trigger_calamity(room, p);
 
     /* 随机判定失败改为“效果打折”：伤害减半（至少保留1点），不跳过回合。 */
@@ -1816,6 +2259,14 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
                                            content, operation, target_name,
                                            &ai_danger, ai_reason, sizeof(ai_reason));
             should_warn = ai_ok == 1 ? ai_danger : heuristic_danger;
+            /* HP 抵抗：威胁判定只在概率上转化为濒死警告，血量越高越抗。 */
+            if (should_warn && warn_target_id > 0) {
+                int vti = player_by_id(room, warn_target_id);
+                if (vti >= 0 &&
+                    rand() % 100 >= warning_chance_from_hp(room->players[vti].hp)) {
+                    should_warn = 0;
+                }
+            }
             if (should_warn && warn_target_id > 0 && room->warning_count < MAX_WARNINGS) {
                 Warning *w = &room->warnings[room->warning_count];
                 memset(w, 0, sizeof(*w));
@@ -1837,6 +2288,14 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
             int heuristic_danger = operation == OP_TWIST && warn_target_id > 0 &&
                                    player_by_id(room, warn_target_id) >= 0 &&
                                    contains_kill_marker(content);
+            /* HP 抵抗：与 AI 判定路径一致，按目标血量概率化。 */
+            if (heuristic_danger && warn_target_id > 0) {
+                int vti = player_by_id(room, warn_target_id);
+                if (vti >= 0 &&
+                    rand() % 100 >= warning_chance_from_hp(room->players[vti].hp)) {
+                    heuristic_danger = 0;
+                }
+            }
             if (heuristic_danger && warn_target_id > 0 && room->warning_count < MAX_WARNINGS) {
                 Warning *w = &room->warnings[room->warning_count];
                 memset(w, 0, sizeof(*w));
@@ -1884,7 +2343,7 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
 
         if (ai_ok == 1 ? rescued : contains_rescue_marker(content)) {
             resolve_victim_warnings(room, p->id);
-            apply_heal(room, p, 2);
+            apply_heal(room, p, 1);
         }
     }
 
@@ -1892,6 +2351,128 @@ int game_speak(int room_id, const char *token, int operation, const char *conten
     if (room->status == ROOM_PLAYING) advance_to_next_alive(room);
 
     return 0;
+}
+
+static void ensure_records_dir(void)
+{
+#ifdef _WIN32
+    _mkdir("records");
+#else
+    mkdir("records", 0755);
+#endif
+}
+
+/* 对局结束后把完整时间线保存为本地回放文件（records/room_<id>.json）。 */
+static void save_room_record(Room *room)
+{
+    char path[128];
+    char timebuf[64];
+    time_t now;
+    struct tm *tm_now;
+    JsonBuf b;
+    FILE *f;
+    int i;
+
+    if (!room) return;
+    ensure_records_dir();
+    snprintf(path, sizeof(path), "records/room_%d.json", room->id);
+
+    now = time(NULL);
+    tm_now = localtime(&now);
+    if (tm_now) strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm_now);
+    else safe_copy(timebuf, sizeof(timebuf), "");
+
+    jsonb_init(&b);
+    jsonb_appendf(&b, "{\"record_id\":%d,", room->id);
+    jsonb_appendf(&b, "\"room_id\":%d,", room->id);
+    jsonb_append(&b, "\"name\":");
+    jsonb_string(&b, room->name);
+    jsonb_appendf(&b, ",\"mode\":%d,", room->mode);
+    jsonb_appendf(&b, "\"difficulty\":%d,", room->difficulty);
+    jsonb_appendf(&b, "\"round\":%d,", room->round);
+    jsonb_appendf(&b, "\"winner_id\":%d,", room->winner_id);
+    jsonb_append(&b, "\"created_at\":");
+    jsonb_string(&b, timebuf);
+    jsonb_append(&b, ",");
+
+    jsonb_append(&b, "\"players\":[");
+    for (i = 0; i < room->player_count; i++) {
+        Player *p = &room->players[i];
+        if (i) jsonb_append(&b, ",");
+        jsonb_append(&b, "{");
+        jsonb_appendf(&b, "\"id\":%d,", p->id);
+        jsonb_append(&b, "\"name\":");
+        jsonb_string(&b, p->name);
+        jsonb_append(&b, ",");
+        jsonb_appendf(&b, "\"is_ai\":%s,", p->is_ai ? "true" : "false");
+        jsonb_appendf(&b, "\"alive\":%s,", p->alive ? "true" : "false");
+        jsonb_appendf(&b, "\"hp\":%d,", p->hp);
+        jsonb_appendf(&b, "\"max_hp\":%d", p->max_hp);
+        jsonb_append(&b, "}");
+    }
+    jsonb_append(&b, "],");
+
+    jsonb_append(&b, "\"narratives\":[");
+    for (i = 0; i < room->narrative_count; i++) {
+        Narrative *n = &room->narratives[i];
+        int pi = player_by_id(room, n->player_id);
+        if (i) jsonb_append(&b, ",");
+        jsonb_append(&b, "{");
+        jsonb_appendf(&b, "\"id\":%d,", n->id);
+        jsonb_appendf(&b, "\"player_id\":%d,", n->player_id);
+        jsonb_append(&b, "\"player_name\":");
+        if (pi >= 0) jsonb_string(&b, room->players[pi].name);
+        else jsonb_string(&b, "系统");
+        jsonb_append(&b, ",");
+        jsonb_appendf(&b, "\"round\":%d,", n->round);
+        jsonb_append(&b, "\"operation\":");
+        jsonb_string(&b, game_op_name(n->operation));
+        jsonb_append(&b, ",");
+        jsonb_append(&b, "\"content\":");
+        jsonb_string(&b, n->content);
+        jsonb_append(&b, ",");
+        jsonb_append(&b, "\"limit_keyword\":");
+        jsonb_string(&b, n->limit_keyword);
+        jsonb_appendf(&b, ",\"target_id\":%d", n->target_id);
+        jsonb_appendf(&b, ",\"damage\":%d", n->damage);
+        jsonb_appendf(&b, ",\"calamity\":%s", n->calamity ? "true" : "false");
+        jsonb_appendf(&b, ",\"notice\":%s", n->notice ? "true" : "false");
+        jsonb_appendf(&b, ",\"green\":%s", n->green ? "true" : "false");
+        jsonb_appendf(&b, ",\"roll_used\":%s", n->roll_used ? "true" : "false");
+        jsonb_appendf(&b, ",\"roll_value\":%d", n->roll_value);
+        jsonb_appendf(&b, ",\"roll_chance\":%d", n->roll_chance);
+        jsonb_appendf(&b, ",\"roll_success\":%s", n->roll_success ? "true" : "false");
+        jsonb_append(&b, ",\"roll_note\":");
+        jsonb_string(&b, n->roll_note);
+        jsonb_append(&b, "}");
+    }
+    jsonb_append(&b, "],");
+
+    jsonb_append(&b, "\"warnings\":[");
+    for (i = 0; i < room->warning_count; i++) {
+        Warning *w = &room->warnings[i];
+        if (i) jsonb_append(&b, ",");
+        jsonb_append(&b, "{");
+        jsonb_appendf(&b, "\"id\":%d,", w->id);
+        jsonb_appendf(&b, "\"victim_id\":%d,", w->victim_id);
+        jsonb_appendf(&b, "\"source_id\":%d,", w->source_id);
+        jsonb_appendf(&b, "\"narrative_id\":%d,", w->narrative_id);
+        jsonb_appendf(&b, "\"resolved\":%s,", w->resolved ? "true" : "false");
+        jsonb_append(&b, "\"reason\":");
+        jsonb_string(&b, w->reason);
+        jsonb_append(&b, "}");
+    }
+    jsonb_append(&b, "]");
+
+    jsonb_append(&b, "}");
+
+    f = fopen(path, "wb");
+    if (f) {
+        fputs(jsonb_cstr(&b), f);
+        fclose(f);
+        debug_log("[record] saved room=%d path=%s", room->id, path);
+    }
+    jsonb_free(&b);
 }
 
 static void finish_if_one_alive(Room *room)
@@ -1908,6 +2489,8 @@ static void finish_if_one_alive(Room *room)
     if (alive_count <= 1 && room->status == ROOM_PLAYING) {
         room->status = ROOM_ENDED;
         room->winner_id = alive_count == 1 ? last : 0;
+
+        save_room_record(room);
 
         /* 独立审核对话：整场结束后交给审核AI。 */
         if (ai_is_configured()) {
@@ -1970,7 +2553,8 @@ static void apply_damage(Room *room, int target_id, int damage, int source_id,
     snprintf(ctx, sizeof(ctx), "damage:%d:%d:%d:%d:%d",
              room->id, source_id, target_id, damage, target->hp);
     status = numeric_review("damage", ctx, reason, target->hp,
-                            target->hp - damage, room->difficulty, &final_hp);
+                            target->hp - damage, room->difficulty,
+                            room->id, room->round, &final_hp);
     target->hp = final_hp;
     target->numeric_status = status;
 
@@ -2032,7 +2616,7 @@ static void apply_heal(Room *room, Player *p, int amount)
     reason = numeric_reason_for_heal(p->hp, p->max_hp);
     snprintf(ctx, sizeof(ctx), "heal:%d:%d:%d:%d", room->id, p->id, amount, p->hp);
     status = numeric_review("heal", ctx, reason, p->hp, p->hp + amount,
-                            room->difficulty, &final_hp);
+                            room->difficulty, room->id, room->round, &final_hp);
     if (final_hp > p->max_hp) final_hp = p->max_hp;
     p->hp = final_hp;
     p->numeric_status = status;
@@ -2103,7 +2687,7 @@ static int ai_try_declare_death(Room *room)
     return 0;
 }
 
-int game_declare_death(int room_id, const char *token, int target_id)
+static int game_declare_death_impl(int room_id, const char *token, int target_id)
 {
     Room *room = game_find_room(room_id);
     Player *p = room ? game_find_player(room, token) : NULL;
@@ -2158,7 +2742,7 @@ int game_declare_death(int room_id, const char *token, int target_id)
     return 0;
 }
 
-int game_gm_command(int room_id, const char *token, const char *action, int target_id)
+static int game_gm_command_impl(int room_id, const char *token, const char *action, int target_id)
 {
     Room *room = game_find_room(room_id);
     Player *p = room ? game_find_player(room, token) : NULL;
@@ -2215,7 +2799,7 @@ const char *game_op_name(int op)
     }
 }
 
-int game_room_to_json_ex(int room_id, const char *token, JsonBuf *out, int process_ai)
+static int game_room_to_json_ex_impl(int room_id, const char *token, JsonBuf *out, int process_ai)
 {
     Room *room = game_find_room(room_id);
     int i;
@@ -2232,8 +2816,9 @@ int game_room_to_json_ex(int room_id, const char *token, JsonBuf *out, int proce
                 advance_to_next_alive(room);
             }
         }
-        /* Process at most one pending AI turn or one AI danger judgment per poll. */
-        process_one_pending_ai_action(room);
+        /* AI 动作改由后台 worker 处理：这里只把房间标记为待办，
+           轮询请求线程不再承担任何 LLM 调用（避免拖慢全服）。 */
+        if (room->status == ROOM_PLAYING) ai_worker_kick(room);
     }
 
     jsonb_append(out, "{");
@@ -2254,6 +2839,10 @@ int game_room_to_json_ex(int room_id, const char *token, JsonBuf *out, int proce
     jsonb_append(out, "\"players\":[");
     for (i = 0; i < room->player_count; i++) {
         Player *pl = &room->players[i];
+        int is_me = token && strcmp(pl->token, token) == 0;
+        /* 灾祸对外只暴露档位（平静/躁动/危险），自己才看得到确切数值。 */
+        int ct = pl->calamity >= CALAMITY_TIER_DANGER ? 2
+               : (pl->calamity >= CALAMITY_TIER_UNEASY ? 1 : 0);
         if (i) jsonb_append(out, ",");
         jsonb_append(out, "{");
         jsonb_appendf(out, "\"id\":%d,", pl->id);
@@ -2265,10 +2854,12 @@ int game_room_to_json_ex(int room_id, const char *token, JsonBuf *out, int proce
         jsonb_appendf(out, "\"is_ai\":%s,", pl->is_ai ? "true" : "false");
         jsonb_appendf(out, "\"hp\":%d,", pl->hp);
         jsonb_appendf(out, "\"max_hp\":%d,", pl->max_hp);
+        jsonb_appendf(out, "\"calamity_tier\":%d,", ct);
+        jsonb_appendf(out, "\"calamity\":%d,", is_me ? pl->calamity : -1);
         jsonb_append(out, "\"numeric_status\":");
         jsonb_string(out, pl->numeric_status ? "adjusted" : "applied");
         jsonb_append(out, ",");
-        jsonb_appendf(out, "\"is_me\":%s", token && strcmp(pl->token, token) == 0 ? "true" : "false");
+        jsonb_appendf(out, "\"is_me\":%s", is_me ? "true" : "false");
         jsonb_append(out, "}");
     }
     jsonb_append(out, "],");
@@ -2341,7 +2932,102 @@ int game_room_to_json_ex(int room_id, const char *token, JsonBuf *out, int proce
     jsonb_append(out, "}");
     return 0;
 }
+/* ------------------------------------------------------------------ */
+/* 公开接口包装：与后台 worker 按房间粒度互斥。                          */
+/* 只有对局中（PLAYING）房间的接口需要加锁；建房/加入/准备等都在         */
+/* WAITING 阶段，worker 从不触碰。                                      */
+/* ------------------------------------------------------------------ */
+int game_create_room(const char *room_name, int mode, int difficulty,
+                     const char *player_name, char *token_out)
+{
+    return game_create_room_impl(room_name, mode, difficulty, player_name, token_out);
+}
+
+int game_join_room(int room_id, const char *player_name, char *token_out)
+{
+    return game_join_room_impl(room_id, player_name, token_out);
+}
+
+int game_add_ai(int room_id)
+{
+    return game_add_ai_impl(room_id);
+}
+
+int game_set_ready(int room_id, const char *token, int ready)
+{
+    return game_set_ready_impl(room_id, token, ready);
+}
+
+int game_start(int room_id, const char *token, int fill_ai)
+{
+    Room *room = game_find_room(room_id);
+    int r;
+    if (!room) return -1;
+    room_lock(room);
+    r = game_start_impl(room_id, token, fill_ai);
+    if (r == 0 && room->status == ROOM_PLAYING) ai_worker_kick(room);
+    room_unlock(room);
+    return r;
+}
+
+int game_speak(int room_id, const char *token, int operation, const char *content,
+               const char *limit_keyword, int target_id,
+               char *error_msg, size_t error_size)
+{
+    Room *room = game_find_room(room_id);
+    int r;
+    if (error_msg && error_size > 0) error_msg[0] = '\0';
+    if (!room) return -1;
+    room_lock(room);
+    r = game_speak_impl(room_id, token, operation, content,
+                        limit_keyword, target_id, error_msg, error_size);
+    if (r == 0 && room->status == ROOM_PLAYING) ai_worker_kick(room);
+    room_unlock(room);
+    return r;
+}
+
+int game_declare_death(int room_id, const char *token, int target_id)
+{
+    Room *room = game_find_room(room_id);
+    int r;
+    if (!room) return -1;
+    room_lock(room);
+    r = game_declare_death_impl(room_id, token, target_id);
+    if (r == 0 && room->status == ROOM_PLAYING) ai_worker_kick(room);
+    room_unlock(room);
+    return r;
+}
+
+int game_gm_command(int room_id, const char *token, const char *action, int target_id)
+{
+    Room *room = game_find_room(room_id);
+    int r;
+    if (!room) return -1;
+    room_lock(room);
+    r = game_gm_command_impl(room_id, token, action, target_id);
+    if (r == 0 && room->status == ROOM_PLAYING) ai_worker_kick(room);
+    room_unlock(room);
+    return r;
+}
+
+int game_room_to_json_ex(int room_id, const char *token, JsonBuf *out, int process_ai)
+{
+    Room *room = game_find_room(room_id);
+    int r;
+    if (!room) return -1;
+    room_lock(room);
+    r = game_room_to_json_ex_impl(room_id, token, out, process_ai);
+    room_unlock(room);
+    return r;
+}
+
 int game_room_to_json(int room_id, const char *token, JsonBuf *out)
 {
-    return game_room_to_json_ex(room_id, token, out, 1);
+    Room *room = game_find_room(room_id);
+    int r;
+    if (!room) return -1;
+    room_lock(room);
+    r = game_room_to_json_ex_impl(room_id, token, out, 1);
+    room_unlock(room);
+    return r;
 }

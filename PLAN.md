@@ -287,80 +287,62 @@ WorldState
 **先公网可访问 + 安全（Phase 0+3A）→ 再用持久化保证连续性（Phase 1）→ 实时通信改善体验（Phase 2）→ 账号/回放/移动端（Phase 4/5）**。
 账号系统不应挡住“能玩”这个核心目标。
 
-## 九、客户端化与互联网联机计划（待确认）
+## 九、客户端化与互联网联机（已落地，仍有增强项）
 
 > 目标：
 > 1. 脱离浏览器，封装成可直接运行的桌面客户端；
 > 2. 支持互联网联机，而不仅限局域网。
 
-### 9.1 客户端化
+### 9.1 客户端化（✅ 已采用 pywebview）
 
-#### 目标
-- 玩家不再需要手动打开浏览器，双击客户端即可进入游戏；
-- 客户端内置本地 HTTP 服务 + 前端页面，自动拉起并显示游戏窗口。
+#### 落地现状
+- 已采用 **pywebview** 桌面客户端（`client/py/client.py`），不再使用 WebView2 作为主方案。
+- 打包产物：`dist/luansha_client_py.exe`。
+- 客户端启动本地 `luansha.exe --no-open 8080`，打开内置游戏窗口并加载前端。
+- 已实现：退出游戏真正关闭客户端（`Api.quit_app`）、公网隧道开关、端口占用/探活提示。
+- 保留浏览器模式：运行 `luansha.exe --no-open 8080` 后访问 `http://localhost:8080`。
 
-#### 方案对比
+#### 方案对比（历史参考）
 
-| 方案 | 说明 | 成本 | 风险 |
-|---|---|---|---|
-| A. WebView2 内嵌（推荐） | Windows 自带 WebView2，客户端启动本地服务后加载 `http://127.0.0.1:port` | 低-中 | 依赖用户系统 WebView2 Runtime（Win10/11 基本自带） |
-| B. Tauri/Electron 包装 | 用前端壳包住现有 web 资源 | 中-高 | 引入 Node/Rust 工具链，项目变复杂 |
-| C. 原生 Win32 UI | 完全自绘界面 | 高 | 工作量大，不划算 |
+| 方案 | 说明 | 结论 |
+|---|---|---|
+| A. WebView2 内嵌 | C 客户端壳 + WebView2 | 曾试做 `client/win/client_webview2.c`，后因白屏/环境问题弃用 |
+| B. pywebview（采用） | Python + pywebview + 本地 HTTP | ✅ 当前客户端方案 |
+| C. Tauri/Electron | Node/Rust 壳 | 未采用，工具链重 |
+| D. 原生 Win32 UI | 自绘界面 | 未采用，工作量大 |
 
-#### 推荐路径
-- 采用 **WebView2 内嵌**：
-  1. 保留现有 `web/` 前端与 C HTTP 服务；
-  2. 新增客户端入口（如 `client/win/main.c`），创建隐藏控制台窗口 + WebView2 窗口；
-  3. 客户端自动启动本地 HTTP 服务，WebView 加载本地地址；
-  4. 支持“启动即建房/快速加入房间码”入口，减少操作步骤；
-  5. 保留 `--no-webview` 或 `--browser` 参数，退回浏览器模式。
+### 9.2 互联网联机（✅ 基础版已落地）
 
-### 9.2 互联网联机
+#### 落地现状
+- 已内置 **Cloudflare Tunnel** 一键开启：
+  - `dist/cloudflared.exe` 与客户端、`luansha.exe` 放在同目录；
+  - 前端“开启公网联机”按钮调用 `Api.start_tunnel()`；
+  - 客户端拉起 `cloudflared --protocol http2 --edge-ip-version 4 --no-autoupdate`，解析 `https://xxx.trycloudflare.com` 并显示。
+- 已实现关闭隧道/停止逻辑。
+- 已知问题：部分网络下 Cloudflare 免费隧道不稳定（如端口 7844 间歇性阻塞），需要保留 fallback。
 
-#### 目标
-- 不同网络下的玩家可通过一个公网地址加入游戏。
+#### 后续增强
+- 支持自定义穿透命令（ngrok / cpolar / frp）：用户配置命令，客户端负责拉起和展示地址。
+- 提供 Tailscale / cpolar / ngrok 备选入口。
+- 启动自检完善：cloudflared 缺失提示、隧道进程异常退出提示。
 
-#### 方案对比
+### 9.3 实施阶段状态
 
-| 方案 | 说明 | 成本 | 风险 |
-|---|---|---|---|
-| A. 内置 Cloudflare Tunnel（推荐） | 客户端自动拉起 `cloudflared`，生成临时公网 HTTPS 地址 | 低 | 免费临时地址每次变化；需分发 `cloudflared.exe` |
-| B. 内置 cpolar/ngrok | 国内/国外可用，但需要用户账号与 token | 中 | 配置门槛高，不适合一键开玩 |
-| C. 自建 frp/云服务器 | 固定地址、稳定 | 高 | 需要额外服务器和运维 |
-
-#### 推荐路径
-- 第一阶段内置 **Cloudflare Tunnel**：
-  1. 项目内附带 `cloudflared.exe`（或首次启动时提示下载）；
-  2. 客户端启动本地服务后，可选“开启互联网联机”；
-  3. 自动运行 `cloudflared tunnel --url http://127.0.0.1:端口`；
-  4. 从输出中解析 `https://xxx.trycloudflare.com` 并显示在客户端界面；
-  5. 玩家复制该地址发给朋友即可加入。
-- 第二阶段支持自定义穿透命令：
-  - 允许用户配置自己的 `ngrok` / `cpolar` / `frp` 命令，客户端负责拉起和展示地址。
-
-### 9.3 实施阶段
-
-#### Step 1：客户端壳
-- 新增 WebView2 客户端入口；
-- 双击启动，自动打开本地游戏窗口；
-- 保留浏览器模式。
-
-#### Step 2：一键互联网联机
-- 集成 `cloudflared`；
-- 客户端界面增加“开启公网联机”按钮；
-- 显示公网地址、复制按钮、关闭隧道按钮。
-
-#### Step 3：体验优化
-- 启动自检（端口占用、WebView2 是否可用、cloudflared 是否存在）；
-- 断线提示与重连；
-- 打包脚本（生成可分发的 exe + 依赖）。
+- ✅ Step 1：pywebview 客户端壳（双击启动、自动打开游戏窗口、退出按钮）
+- ✅ Step 2：Cloudflare 一键公网联机（开启/显示/关闭）
+- ⏳ Step 3：体验优化
+  - cloudflared 缺失/异常检测；
+  - 断线提示与重连；
+  - 一键打包/分发脚本整理（`build.bat` + PyInstaller 命令）。
 
 ### 9.4 优先级建议
-1. 先做客户端壳（不依赖穿透，可独立发布）；
-2. 再内置 cloudflared 一键公网；
-3. 最后做自定义穿透与打包优化。
+
+1. 完成打包/分发脚本整理；
+2. 自定义穿透命令支持；
+3. Cloudflare 不稳定时 fallback 方案（Tailscale / cpolar / ngrok）。
 
 ### 9.5 风险与注意
-- WebView2 在旧 Windows 上可能缺失，需提供检测与安装引导；
-- cloudflared 免费隧道地址随机，适合熟人临时联机，不适合长期固定入口；
-- 如果目标用户都在国内，Cloudflare 隧道可能不稳定，需保留 cpolar 自定义方案。
+
+- 免费 trycloudflare 地址每次变化，适合熟人临时联机；
+- 分发包需同时包含 `luansha.exe`、`cloudflared.exe`、`luansha_client_py.exe`；
+- 国内网络 Cloudflare 隧道可能不稳定，需保留 cpolar 自定义方案。

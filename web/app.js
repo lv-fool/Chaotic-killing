@@ -54,7 +54,7 @@ function stateKey(room) {
     room.round,
     room.turn_index,
     room.turn_player_id,
-    room.players.map(p => `${p.id}:${p.alive}:${p.ready}`).join('|'),
+    room.players.map(p => `${p.id}:${p.alive}:${p.ready}:${p.hp}:${p.calamity_tier}:${p.calamity}`).join('|'),
     room.narratives.length,
     lastNarration,
     room.warnings.filter(w => !w.resolved).length,
@@ -144,6 +144,95 @@ async function startPublicTunnel() {
     el.textContent = '开启失败：' + e.message;
   }
 }
+
+/* ---------------- 历史战绩 / 回放 ---------------- */
+
+let recordsVisible = false;
+let recordsCache = [];
+
+async function toggleRecords() {
+  const panel = $('records-view');
+  const status = $('records-status');
+  if (!panel) return;
+  if (recordsVisible) {
+    panel.classList.add('hidden');
+    recordsVisible = false;
+    return;
+  }
+  recordsVisible = true;
+  panel.classList.remove('hidden');
+  if (status) status.textContent = '加载中…';
+  try {
+    const data = await api('/api/records');
+    recordsCache = data.records || [];
+    if (status) status.textContent = '';
+    renderRecordsList(recordsCache);
+  } catch (e) {
+    if (status) status.textContent = '加载失败：' + e.message;
+  }
+}
+
+function renderRecordsList(records) {
+  const el = $('records-list');
+  if (!el) return;
+  if (!records.length) {
+    el.innerHTML = '<p class="hint">暂无历史对局。</p>';
+    return;
+  }
+  const diffNames = ['休闲', '普通', '困难', '噩梦', '地狱'];
+  el.innerHTML = records.map(r => `
+    <div class="record-card">
+      <div><strong>${escaped(r.name)}</strong> · ${diffNames[r.difficulty] || r.difficulty}</div>
+      <div class="hint">房间 ${r.room_id} · ${escaped(r.created_at || '')} · 玩家 ${r.player_count} · 叙事 ${r.narrative_count}</div>
+      <div>胜者：${escaped(r.winner_name || ('玩家' + r.winner_id))}</div>
+      <button onclick="showRecordDetail(${r.record_id})">查看回放</button>
+    </div>
+  `).join('');
+}
+
+async function showRecordDetail(recordId) {
+  const el = $('records-list');
+  if (!el) return;
+  el.innerHTML = '<p class="hint">加载回放…</p>';
+  try {
+    const res = await fetch('/api/records?id=' + encodeURIComponent(recordId));
+    const data = await res.json();
+    renderRecordDetail(data);
+  } catch (e) {
+    el.innerHTML = '<p class="hint">加载失败：' + escaped(e.message) + '</p>';
+  }
+}
+
+function renderRecordDetail(record) {
+  const el = $('records-list');
+  if (!el) return;
+  if (!record || !record.narratives) {
+    el.innerHTML = '<p class="hint">回放不存在。</p>';
+    return;
+  }
+  const diffNames = ['休闲', '普通', '困难', '噩梦', '地狱'];
+  const players = (record.players || []).map(p => `
+    <span class="${p.alive ? '' : 'record-dead'}">${escaped(p.name)}${p.is_ai ? '(AI)' : ''}${p.alive ? '' : ' ☠'}</span>
+  `).join(' ');
+  const nars = (record.narratives || []).map(n => `
+    <div class="record-narrative ${n.calamity ? 'calamity' : ''} ${n.notice ? 'notice' : ''} ${n.green ? 'green' : ''}">
+      <span class="record-round">R${n.round}</span>
+      <strong>${escaped(n.player_name)}</strong>
+      <span class="record-op">[${escaped(n.operation)}]</span>
+      ${escaped(n.content)}
+    </div>
+  `).join('');
+  el.innerHTML = `
+    <div class="record-detail">
+      <div><button onclick="renderRecordsList(recordsCache)">← 返回列表</button></div>
+      <h3>${escaped(record.name)}</h3>
+      <div class="hint">难度 ${diffNames[record.difficulty] || record.difficulty} · 胜者 ${escaped(record.winner_name || '')} · ${escaped(record.created_at || '')}</div>
+      <div class="record-players">${players}</div>
+      <div class="record-narratives">${nars}</div>
+    </div>
+  `;
+}
+
 
 /* ---------------- 大厅操作 ---------------- */
 
@@ -520,6 +609,19 @@ function playerState(p) {
   return '健康';
 }
 
+/* 灾祸状态：对外只显示档位，自己的确切数值才可见。
+   数值可逆——言之有物的叙述会把它压下去。 */
+function calamityInfo(p) {
+  if (!p.alive) return '';
+  const tier = p.calamity_tier || 0;
+  const mine = p.is_me && p.calamity >= 0;
+  if (tier <= 0 && !mine) return '';
+  const label = tier >= 2 ? '危险' : (tier >= 1 ? '躁动' : '平静');
+  const cls = tier >= 2 ? 'cal-danger' : (tier >= 1 ? 'cal-uneasy' : 'cal-calm');
+  const exact = mine ? ` ${p.calamity}` : '';
+  return `<span class="calamity-tag ${cls}">灾祸·${label}${exact}</span>`;
+}
+
 function renderPlayers(room) {
   const list = room.players.map(p => {
     const classes = ['player-card'];
@@ -531,6 +633,7 @@ function renderPlayers(room) {
       ${p.is_me ? '（我）' : ''}
       ${!p.alive ? '💀' : ''}
       <span class="player-state state-${state}">${state}</span>
+      ${calamityInfo(p)}
     </div>`;
   }).join('');
   $('player-list').innerHTML = `<div>${list}</div>`;

@@ -30,6 +30,7 @@ debug_operations.log
 numeric_audit.log
 cloudflared.log
 cloudflared.exe
+records/
 
 # 预览/临时文件
 client_preview.html
@@ -41,3 +42,6 @@ client_white_check.png
 # Python
 __pycache__/
 *.pyc
+
+# WorkBuddy 工作区数据（会话记忆等本地运行时数据，勿提交）
+.workbuddy/
