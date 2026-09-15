@@ -96,6 +96,10 @@ int ai_try_judge_narration(
 /*
  * Try to generate an AI player's one-sentence narration.
  * Returns 1 on success and fills out; returns 0 to let caller use fallback.
+ *
+ * avoid_text: the sentences this AI player has already said (one per line).
+ *             Rendered as an explicit "do not repeat" block, placed last in the
+ *             prompt because instructions near the output have the most weight.
  */
 int ai_try_generate_narration(
     const char *room_name,
@@ -103,6 +107,7 @@ int ai_try_generate_narration(
     const char *ai_name,
     const char *recent_text,
     const char *constraint,
+    const char *avoid_text,
     char *out,
     size_t out_size);
 
@@ -131,6 +136,7 @@ int ai_try_generate_attack(
     const char *ai_name,
     const char *recent_text,
     const char *constraint,
+    const char *avoid_text,
     char *content_out, size_t content_size,
     char *target_out, size_t target_size,
     int *danger_out,
@@ -149,6 +155,7 @@ int ai_try_generate_rescue(
     const char *ai_name,
     const char *recent_text,
     const char *constraint,
+    const char *avoid_text,
     char *content_out, size_t content_size,
     int *rescued_out,
     char *reason_out, size_t reason_size);

@@ -459,3 +459,49 @@ button.primary:hover {
   color: #ffd166;
   margin: 0 4px;
 }
+
+.record-target {
+  color: #7dd3fc;
+  background: #1b2b3a;
+  border: 1px solid #3a6a8a;
+  border-radius: 999px;
+  padding: 1px 8px;
+  margin-left: 6px;
+  font-size: 13px;
+}
+
+.record-warnings {
+  margin-top: 10px;
+  border: 1px solid #444466;
+  border-radius: 8px;
+  padding: 8px;
+  background: #1e1e32;
+}
+
+.record-warnings h4 {
+  margin: 0 0 6px;
+  color: #ffd166;
+}
+
+.record-warning {
+  padding: 5px 6px;
+  border-bottom: 1px solid #2a2a44;
+}
+
+.record-warning-status {
+  margin-left: 8px;
+  font-weight: bold;
+}
+
+.record-warning.resolved .record-warning-status {
+  color: #7dffa8;
+}
+
+.record-warning.unresolved .record-warning-status {
+  color: #ff6b6b;
+}
+
+.record-warning-source {
+  color: #9999b0;
+  margin-left: 6px;
+}

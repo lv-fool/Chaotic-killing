@@ -211,23 +211,51 @@ function renderRecordDetail(record) {
     return;
   }
   const diffNames = ['休闲', '普通', '困难', '噩梦', '地狱'];
+  const playerNames = {};
+  (record.players || []).forEach(p => { playerNames[p.id] = p.name; });
   const players = (record.players || []).map(p => `
     <span class="${p.alive ? '' : 'record-dead'}">${escaped(p.name)}${p.is_ai ? '(AI)' : ''}${p.alive ? '' : ' ☠'}</span>
   `).join(' ');
-  const nars = (record.narratives || []).map(n => `
+  const nars = (record.narratives || []).map(n => {
+    const target = n.target_id && playerNames[n.target_id]
+      ? ` <span class="record-target">→ ${escaped(playerNames[n.target_id])}</span>`
+      : '';
+    return `
     <div class="record-narrative ${n.calamity ? 'calamity' : ''} ${n.notice ? 'notice' : ''} ${n.green ? 'green' : ''}">
       <span class="record-round">R${n.round}</span>
       <strong>${escaped(n.player_name)}</strong>
       <span class="record-op">[${escaped(n.operation)}]</span>
-      ${escaped(n.content)}
+      ${escaped(n.content)}${target}
     </div>
-  `).join('');
+  `;
+  }).join('');
+  /* 新回放：警告已写进 narratives 时间线；旧回放没有这些事件时，退回独立区块展示。 */
+  const hasWarningEvents = (record.narratives || []).some(n =>
+    n.operation === '濒死警告' || n.operation === '警告解除'
+  );
+  const warns = !hasWarningEvents
+    ? (record.warnings || []).map(w => {
+        const victim = playerNames[w.victim_id] || ('玩家' + w.victim_id);
+        const source = playerNames[w.source_id] || ('玩家' + w.source_id);
+        const status = w.resolved ? '✅ 已解除' : '❌ 未解除';
+        return `
+        <div class="record-warning ${w.resolved ? 'resolved' : 'unresolved'}">
+          <span class="record-round">#${w.id}</span>
+          <strong>${escaped(victim)}</strong>
+          <span class="record-warning-source">← 来源：${escaped(source)}</span>
+          <span class="record-warning-status">${status}</span>
+          <div class="hint">${escaped(w.reason)}</div>
+        </div>
+      `;
+      }).join('')
+    : '';
   el.innerHTML = `
     <div class="record-detail">
       <div><button onclick="renderRecordsList(recordsCache)">← 返回列表</button></div>
       <h3>${escaped(record.name)}</h3>
       <div class="hint">难度 ${diffNames[record.difficulty] || record.difficulty} · 胜者 ${escaped(record.winner_name || '')} · ${escaped(record.created_at || '')}</div>
       <div class="record-players">${players}</div>
+      ${warns ? `<div class="record-warnings"><h4>濒死警告记录</h4>${warns}</div>` : ''}
       <div class="record-narratives">${nars}</div>
     </div>
   `;

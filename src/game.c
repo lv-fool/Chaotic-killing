@@ -853,6 +853,7 @@ static void resolve_victim_warnings(Room *room, int victim_id)
     for (i = 0; i < room->warning_count; i++) {
         if (room->warnings[i].victim_id == victim_id && !room->warnings[i].resolved) {
             room->warnings[i].resolved = 1;
+            room->warnings[i].resolved_round = room->round;
             debug_log("[warning_resolve] room=%d victim=%d source=%d reason=%s",
                       room->id, victim_id, room->warnings[i].source_id,
                       room->warnings[i].reason);
@@ -1082,48 +1083,112 @@ static void ai_history_push(Player *p, const char *msg)
     p->ai_history_count++;
 }
 
-static void ai_history_append_to_recent(Player *p, char *recent_text, size_t recent_size)
+/* 把该 AI 自己说过的话整理成"禁止重复"清单（去掉"名字："前缀，每行一句）。
+   单独成段传给模型，而不是混进"最近发生的事"，这样它不会和全场叙事抢缓冲，
+   也不会因为缓冲写满而被静默丢弃。 */
+static void ai_history_build_avoid(Player *p, char *out, size_t out_size)
 {
     int i;
-    if (!p || !recent_text || recent_size == 0) return;
+    if (!p || !out || out_size == 0) return;
+    out[0] = '\0';
     for (i = 0; i < p->ai_history_count; i++) {
-        size_t used = strlen(recent_text);
-        if (used + strlen(p->ai_history[i]) + 2 >= recent_size) break;
-        strncat(recent_text, p->ai_history[i], recent_size - used - 1);
-        strncat(recent_text, "\n", recent_size - strlen(recent_text) - 1);
+        const char *line = p->ai_history[i];
+        const char *sep = strstr(line, "：");
+        size_t used;
+        if (sep) line = sep + strlen("：");
+        if (!*line) continue;
+        used = strlen(out);
+        if (used + strlen(line) + 4 >= out_size) break;
+        strncat(out, "- ", out_size - used - 1);
+        strncat(out, line, out_size - strlen(out) - 1);
+        strncat(out, "\n", out_size - strlen(out) - 1);
     }
+}
+
+/* AI 专属的复读检查：与自己历史发言比对。
+   真人玩家的惯用句不算抄袭（见 sentence_too_similar 的注释），
+   但 AI 反复吐同一句就是复读机，必须拦住。 */
+static int ai_repeats_self(const char *content, Player *p)
+{
+    int i;
+    size_t clen = 0;
+    size_t j;
+    if (!content || !*content || !p) return 0;
+    for (j = 0; content[j]; j += utf8_char_len(content + j)) clen++;
+    if (clen < 6) return 0;
+    for (i = 0; i < p->ai_history_count; i++) {
+        const char *line = p->ai_history[i];
+        const char *sep = strstr(line, "：");
+        size_t olen = 0;
+        size_t span;
+        if (sep) line = sep + strlen("：");
+        if (!*line) continue;
+        for (j = 0; line[j]; j += utf8_char_len(line + j)) olen++;
+        if (olen < 6) continue;
+        span = longest_common_span(content, line);
+        if (span >= 12) return 1;
+        if (span * 10 >= (olen < clen ? olen : clen) * 7) return 1;
+    }
+    return 0;
+}
+
+/* 兜底模板池：按操作类型分类。
+   原先把所有回退句挤在"观察/移动"这一类上，等于系统在主动教 AI 说保守句。 */
+static const char *fallback_line_for_op(int op)
+{
+    static const char *create_lines[] = {
+        "我拆下墙角的木条，把一头削尖了握在手里。",
+        "我把两只空罐子绑在一起，做成一个简易的响铃。",
+        "我撕开外套袖口，把布条一圈圈缠在手掌上防滑。",
+        "我把拖把杆拆下来，用碎布缠住一头。",
+        "我撬开地板的边缘，把铁钉一颗颗拔出来收进口袋。"
+    };
+    static const char *twist_lines[] = {
+        "我一脚踢翻脚边的油桶，让它朝门口滚过去。",
+        "我伸手扯断了头顶那根松动的电线。",
+        "我把身后的铁门推上，卡住了门缝。",
+        "我抓住货架的边角用力一拽，让它朝过道倒下去。",
+        "我踢起地上的碎石子，砸向对面那扇窗。"
+    };
+    static const char *explain_lines[] = {
+        "我按住肋下的伤口，把身体挪到货架背后。",
+        "我贴着墙根慢慢蹲下，让货架挡住自己的轮廓。",
+        "我屏住呼吸，把重心压到脚后跟上稳住身体。",
+        "我扯下衣角，缠紧了正在流血的那条手臂。",
+        "我退到通风管的阴影里，压低身子。"
+    };
+    static const char *normal_lines[] = {
+        "我数着对面那人换弹的动作，趁间隙冲过通道。",
+        "我贴着墙根绕到他侧后方，脚步压在地砖的缝上。",
+        "我捡起脚边的半块砖头，掂了掂分量。",
+        "我盯着他手里的东西，慢慢往门口挪。",
+        "我伸手摸到身后的门把，试着拧了一下。"
+    };
+    const char **pool = normal_lines;
+    int n = (int)(sizeof(normal_lines) / sizeof(normal_lines[0]));
+
+    if (op == OP_CREATE) {
+        pool = create_lines;
+        n = (int)(sizeof(create_lines) / sizeof(create_lines[0]));
+    } else if (op == OP_TWIST) {
+        pool = twist_lines;
+        n = (int)(sizeof(twist_lines) / sizeof(twist_lines[0]));
+    } else if (op == OP_EXPLAIN) {
+        pool = explain_lines;
+        n = (int)(sizeof(explain_lines) / sizeof(explain_lines[0]));
+    }
+    return pool[rand() % n];
 }
 
 static void ai_speak_current(Room *room)
 {
-    static const char *lines[] = {
-        "我环顾四周，保持警惕。",
-        "我悄悄移动到掩体后面。",
-        "我观察着每个人的动作。",
-        "我握紧武器，准备应对突发情况。",
-        "我保持沉默，等待时机。",
-        "我检查了一下周围的痕迹。",
-        "我缓缓后退，拉开距离。",
-        "我在角落里布下了一个小陷阱。",
-        "我翻找身边的口袋，找到了一根绳子。",
-        "我抬头观察天花板，寻找可以利用的结构。",
-        "我开始在沙地上画图，假装在计算什么。",
-        "我把桌上的杯子慢慢推向桌边。",
-        "我假装看向窗外，实际上留意着每个人的反应。",
-        "我拆下了一截金属管，握在手里。",
-        "我蹲下身系鞋带，趁机记住每个人的站位。",
-        "我低声吹着口哨，慢慢靠近门口。",
-        "我捡起一片碎玻璃，反射着光观察众人。",
-        "我靠着墙坐下，看起来很放松。",
-        "我故意弄出一点声响，试探周围的反应。",
-        "我在心里默数着每个人的呼吸节奏。"
-    };
     Player *p;
     Narrative *n;
     char content[MAX_CONTENT];
     char players_text[512] = "";
-    char recent_text[1024] = "";
-    char constraint[256] = "";
+    char recent_text[3072] = "";
+    char avoid_text[1536] = "";
+    char constraint[1024] = "";
     char ai_text[512] = "";
     int op = OP_NORMAL;
     int i;
@@ -1144,6 +1209,7 @@ static void ai_speak_current(Room *room)
     int roll_success = 1;
     char roll_note[128] = "";
     char kept[MAX_CONTENT];   /* 复制判定退下时的第一版台词（重试失败时容忍回退） */
+    int kept_repeat = 0;      /* 1 = 被退回的第一版是"复读自己"，不允许容忍 */
     content[0] = '\0';
     kept[0] = '\0';
 
@@ -1167,7 +1233,9 @@ static void ai_speak_current(Room *room)
                 sizeof(players_text) - strlen(players_text) - 1);
     }
 
-    start = room->narrative_count > 3 ? room->narrative_count - 3 : 0;
+    /* 只取最近 4 条全场叙事作为"最近发生的事"；AI 自己说过的话单独走
+       avoid_text，作为禁重复清单，两者不再争抢同一个缓冲区。 */
+    start = room->narrative_count > 4 ? room->narrative_count - 4 : 0;
     for (i = start; i < room->narrative_count; i++) {
         char line[600];
         Player *np = &room->players[0];
@@ -1176,9 +1244,7 @@ static void ai_speak_current(Room *room)
         snprintf(line, sizeof(line), "%s：%s\n", np->name, room->narratives[i].content);
         strncat(recent_text, line, sizeof(recent_text) - strlen(recent_text) - 1);
     }
-
-    /* 加入该 AI 自己的独立历史，使其能记住自己之前的行动。 */
-    ai_history_append_to_recent(p, recent_text, sizeof(recent_text));
+    ai_history_build_avoid(p, avoid_text, sizeof(avoid_text));
 
     if (player_has_unresolved_warning(room, p->id)) {
         snprintf(constraint, sizeof(constraint), "你正处于濒死状态，请描述如何化解危机。");
@@ -1264,7 +1330,7 @@ retry_generate:
         if (attack_mode) {
             char atk_target[64] = "";
             if (ai_try_generate_attack(room->name, players_text, p->name,
-                                       recent_text, constraint,
+                                       recent_text, constraint, avoid_text,
                                        ai_text, sizeof(ai_text),
                                        atk_target, sizeof(atk_target),
                                        &attack_danger,
@@ -1285,7 +1351,7 @@ retry_generate:
             }
         } else if (player_has_unresolved_warning(room, p->id)) {
             if (ai_try_generate_rescue(room->name, players_text, p->name,
-                                       recent_text, constraint,
+                                       recent_text, constraint, avoid_text,
                                        ai_text, sizeof(ai_text),
                                        &rescue_success,
                                        rescue_reason, sizeof(rescue_reason)) == 1 &&
@@ -1296,7 +1362,8 @@ retry_generate:
             }
         } else {
             if (ai_try_generate_narration(room->name, players_text, p->name,
-                                          recent_text, constraint, ai_text,
+                                          recent_text, constraint, avoid_text,
+                                          ai_text,
                                           sizeof(ai_text)) == 1 && ai_text[0]) {
                 snprintf(content, sizeof(content), "%s", ai_text);
                 content_ok = 1;
@@ -1304,18 +1371,24 @@ retry_generate:
         }
     } else {
         if (ai_try_generate_narration(room->name, players_text, p->name,
-                                      recent_text, constraint, ai_text,
+                                      recent_text, constraint, avoid_text,
+                                      ai_text,
                                       sizeof(ai_text)) == 1 && ai_text[0]) {
             snprintf(content, sizeof(content), "%s", ai_text);
             content_ok = 1;
         }
     }
 after_generation:
-    /* 简单去重：与最近一条完全相同的生成结果视为失败，走回退模板。 */
-    if (content_ok && room->narrative_count > 0 &&
-        strcmp(content, room->narratives[room->narrative_count - 1].content) == 0) {
-        content_ok = 0;
-        content[0] = '\0';
+    /* 逐字复读：与最近 3 条任意一条完全相同，直接视为失败。 */
+    if (content_ok) {
+        int dup_start = room->narrative_count > 3 ? room->narrative_count - 3 : 0;
+        for (i = dup_start; i < room->narrative_count; i++) {
+            if (strcmp(content, room->narratives[i].content) == 0) {
+                content_ok = 0;
+                content[0] = '\0';
+                break;
+            }
+        }
     }
     /* 规则闸口：AI 与真人在"单句/连词/移动限制"上执行同一套本地硬校验。
        命中后带原因重生成（硬规则仅重试 1 次，重试太多会加剧供应商限流）。 */
@@ -1354,25 +1427,39 @@ after_generation:
             content[0] = '\0';
         }
     }
-    /* 防复制：只与最近 2 名其他玩家比对（字符级、占较短句 60% 才算）。
-       命中：保存第一版 → 重试 1 次 → 重试失败时容忍第一版（避免"拒绝→
+    /* 防复制：与其他玩家最近 2 条发言比对（字符级、占较短句 60% 才算）；
+       同时做 AI 专属的自我复读检查——真人的惯用句不算抄袭，但 AI 反复说
+       同一句就是复读机，必须拦。
+       命中：保存第一版 → 重试 → 重试失败时容忍第一版（避免"拒绝→
        重试网络失败→模板"的死循环刷屏）。 */
-    if (content_ok && room->narrative_count > 0 &&
-        sentence_too_similar(content, room, p->id)) {
-        debug_log("[ai_content_rejected] room=%d player=%s content=%s reason=%s",
-                  room->id, p->name, content[0] ? content : "(empty)", "copycat");
-        if (gen_retry < 2) {
-            safe_copy(kept, sizeof(kept), content);
-            gen_retry++;
-            strncat(constraint,
-                    "；你上一次的发言与最近发言过于相似（不要重复或改写其他玩家刚说过的话）。请重新生成一句全新的内容。",
-                    sizeof(constraint) - strlen(constraint) - 1);
+    if (content_ok &&
+        (room->narrative_count > 0 || p->ai_history_count > 0)) {
+        int self_repeat = ai_repeats_self(content, p);
+        if (self_repeat || sentence_too_similar(content, room, p->id)) {
+            debug_log("[ai_content_rejected] room=%d player=%s content=%s reason=%s",
+                      room->id, p->name, content[0] ? content : "(empty)",
+                      self_repeat ? "self_repeat" : "copycat");
+            if (gen_retry < 2) {
+                safe_copy(kept, sizeof(kept), content);
+                kept_repeat = self_repeat;
+                gen_retry++;
+                if (self_repeat) {
+                    strncat(constraint,
+                            "；你上一次的发言和你说过的旧句子几乎一样（禁止复读自己）。"
+                            "请换一个完全不同的动作、不同的物件和不同的写法。",
+                            sizeof(constraint) - strlen(constraint) - 1);
+                } else {
+                    strncat(constraint,
+                            "；你上一次的发言与最近发言过于相似（不要重复或改写其他玩家刚说过的话）。请重新生成一句全新的内容。",
+                            sizeof(constraint) - strlen(constraint) - 1);
+                }
+                content_ok = 0;
+                content[0] = '\0';
+                goto retry_generate;
+            }
             content_ok = 0;
             content[0] = '\0';
-            goto retry_generate;
         }
-        content_ok = 0;
-        content[0] = '\0';
     }
     /* 语法/合理性审查（LLM 加权）：不合格时重新生成，最多重试 2 次。 */
     if (content_ok) {
@@ -1415,8 +1502,9 @@ after_generation:
         debug_log("[penalty] room=%d player=%s penalty=2 action=no_move", room->id, p->name);
     }
     /* 重试因网络失败而空手时：若保留的第一版已通过硬规则（仅因轻微相似被退回），
-       直接采用它，避免"拒绝→重试网络失败→模板"的死循环刷屏。 */
-    if (!content_ok && !attack_mode && kept[0]) {
+       直接采用它，避免"拒绝→重试网络失败→模板"的死循环刷屏。
+       但"复读自己"不在容忍之列——那正是要拦的行为，宁可走分类兜底。 */
+    if (!content_ok && !attack_mode && kept[0] && !kept_repeat) {
         safe_copy(content, sizeof(content), kept);
         kept[0] = '\0';
         content_ok = 1;
@@ -1427,7 +1515,9 @@ after_generation:
         if (attack_mode && attack_target_id > 0) {
             int ti = player_by_id(room, attack_target_id);
             if (ti >= 0) {
-                snprintf(content, sizeof(content), "我抄起手边最近的硬物，朝%s猛砸过去。", room->players[ti].name);
+                snprintf(content, sizeof(content),
+                         "我抡起手边那截铁管，朝%s的小腿扫过去。",
+                         room->players[ti].name);
                 attack_danger = 0;
                 attack_reason[0] = '\0';
                 debug_log("[ai_fallback] room=%d player=%s reason=attack_generation_failed",
@@ -1435,17 +1525,18 @@ after_generation:
             }
         }
         if (content[0] == '\0') {
-            if (ai_is_configured()) {
-                if (!p->has_spoken_first) snprintf(content, sizeof(content), "我走出了家门。");
-                else snprintf(content, sizeof(content), "我警惕地环顾四周，寻找破绽。");
-            } else if (!p->has_spoken_first) {
-                snprintf(content, sizeof(content), "我走出了家门。");
+            if (!p->has_spoken_first) {
+                snprintf(content, sizeof(content), "我推开家门走到街上。");
             } else if (player_has_unresolved_warning(room, p->id)) {
-                snprintf(content, sizeof(content), "我躲开了这次攻击。");
+                snprintf(content, sizeof(content),
+                         "我侧身滚到货架背后，让那一下砸在空处。");
             } else if (room->limit.remaining > 0 && room->limit.keyword[0]) {
-                snprintf(content, sizeof(content), "%s我继续等待时机。", room->limit.keyword);
+                snprintf(content, sizeof(content), "%s我贴着墙根挪了半步。",
+                         room->limit.keyword);
             } else {
-                snprintf(content, sizeof(content), "%s", lines[rand() % (sizeof(lines) / sizeof(lines[0]))]);
+                /* 按操作类型取兜底句：原先是无论什么操作都回同一句"环顾四周"，
+                   等于系统在主动教 AI 说保守句。 */
+                snprintf(content, sizeof(content), "%s", fallback_line_for_op(op));
             }
         }
     }
@@ -1578,6 +1669,7 @@ after_generation:
             w->source_id = p->id;
             w->narrative_id = n->id;
             w->resolved = 0;
+            w->created_round = room->round;
             if (attack_reason[0]) {
                 safe_copy(w->reason, sizeof(w->reason), attack_reason);
             } else {
@@ -1619,6 +1711,7 @@ after_generation:
                 w->source_id = p->id;
                 w->narrative_id = n->id;
                 w->resolved = 0;
+            w->created_round = room->round;
                 safe_copy(w->reason, sizeof(w->reason), jreason[0] ? jreason : content);
                 debug_log("[warning_create] room=%d victim=%d source=%d reason=%s",
                           room->id, mtarget, p->id, w->reason);
@@ -2275,6 +2368,7 @@ static int game_speak_impl(int room_id, const char *token, int operation, const 
                 w->source_id = p->id;
                 w->narrative_id = n->id;
                 w->resolved = 0;
+            w->created_round = room->round;
                 if (ai_ok == 1 && ai_reason[0]) {
                     snprintf(w->reason, sizeof(w->reason), "%s", ai_reason);
                 } else {
@@ -2304,6 +2398,7 @@ static int game_speak_impl(int room_id, const char *token, int operation, const 
                 w->source_id = p->id;
                 w->narrative_id = n->id;
                 w->resolved = 0;
+            w->created_round = room->round;
                 snprintf(w->reason, sizeof(w->reason), "%s", content);
                 debug_log("[warning_create] room=%d victim=%d source=%d reason=%s",
                           room->id, warn_target_id, p->id, w->reason);
@@ -2362,28 +2457,86 @@ static void ensure_records_dir(void)
 #endif
 }
 
-/* 对局结束后把完整时间线保存为本地回放文件（records/room_<id>.json）。 */
+/* 把某一轮内发生的濒死警告创建/解除事件输出为回放中的系统叙事。
+   这样回放时间线内部就能看到警告记录，而不是只有独立 warnings 数组。 */
+static void append_record_warning_events(JsonBuf *b, Room *room, int round, int *first)
+{
+    int i;
+    if (!b || !room || !first) return;
+    for (i = 0; i < room->warning_count; i++) {
+        Warning *w = &room->warnings[i];
+        int vi, si;
+        const char *victim, *source;
+        char content[640];
+
+        if (w->created_round == round && w->created_round > 0) {
+            vi = player_by_id(room, w->victim_id);
+            si = player_by_id(room, w->source_id);
+            victim = vi >= 0 ? room->players[vi].name : "?";
+            source = si >= 0 ? room->players[si].name : "?";
+            snprintf(content, sizeof(content), "濒死警告：%s 被 %s 逼入绝境 —— %s",
+                     victim, source, w->reason);
+            if (!*first) jsonb_append(b, ",");
+            *first = 0;
+            jsonb_append(b, "{");
+            jsonb_appendf(b, "\"id\":%d,", 100000 + w->id);
+            jsonb_appendf(b, "\"player_id\":0,");
+            jsonb_append(b, "\"player_name\":\"系统\",");
+            jsonb_appendf(b, "\"round\":%d,", round);
+            jsonb_append(b, "\"operation\":\"濒死警告\",");
+            jsonb_append(b, "\"content\":");
+            jsonb_string(b, content);
+            jsonb_append(b, ",\"limit_keyword\":\"\",\"target_id\":0,\"damage\":0,\"calamity\":false,\"notice\":true,\"green\":false,\"roll_used\":false,\"roll_value\":0,\"roll_chance\":0,\"roll_success\":false,\"roll_note\":\"\"}");
+        }
+
+        if (w->resolved_round == round && w->resolved_round > 0) {
+            vi = player_by_id(room, w->victim_id);
+            si = player_by_id(room, w->source_id);
+            victim = vi >= 0 ? room->players[vi].name : "?";
+            source = si >= 0 ? room->players[si].name : "?";
+            snprintf(content, sizeof(content), "濒死警告已解除：%s 摆脱了 %s 的致命威胁。",
+                     victim, source);
+            if (!*first) jsonb_append(b, ",");
+            *first = 0;
+            jsonb_append(b, "{");
+            jsonb_appendf(b, "\"id\":%d,", 101000 + w->id);
+            jsonb_appendf(b, "\"player_id\":0,");
+            jsonb_append(b, "\"player_name\":\"系统\",");
+            jsonb_appendf(b, "\"round\":%d,", round);
+            jsonb_append(b, "\"operation\":\"警告解除\",");
+            jsonb_append(b, "\"content\":");
+            jsonb_string(b, content);
+            jsonb_append(b, ",\"limit_keyword\":\"\",\"target_id\":0,\"damage\":0,\"calamity\":false,\"notice\":true,\"green\":false,\"roll_used\":false,\"roll_value\":0,\"roll_chance\":0,\"roll_success\":false,\"roll_note\":\"\"}");
+        }
+    }
+}
+
+/* 对局结束后把完整时间线保存为本地回放文件。
+   文件名使用 时间戳+房间ID 保证唯一，避免每次重启房间ID复用导致覆盖旧回放。 */
 static void save_room_record(Room *room)
 {
-    char path[128];
+    char path[160];
     char timebuf[64];
     time_t now;
     struct tm *tm_now;
+    long long record_id;
     JsonBuf b;
     FILE *f;
     int i;
 
     if (!room) return;
     ensure_records_dir();
-    snprintf(path, sizeof(path), "records/room_%d.json", room->id);
 
     now = time(NULL);
+    record_id = (long long)now * 100 + room->id;
+    snprintf(path, sizeof(path), "records/record_%lld.json", record_id);
+
     tm_now = localtime(&now);
     if (tm_now) strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm_now);
     else safe_copy(timebuf, sizeof(timebuf), "");
 
     jsonb_init(&b);
-    jsonb_appendf(&b, "{\"record_id\":%d,", room->id);
+    jsonb_appendf(&b, "{\"record_id\":%lld,", record_id);
     jsonb_appendf(&b, "\"room_id\":%d,", room->id);
     jsonb_append(&b, "\"name\":");
     jsonb_string(&b, room->name);
@@ -2413,38 +2566,49 @@ static void save_room_record(Room *room)
     jsonb_append(&b, "],");
 
     jsonb_append(&b, "\"narratives\":[");
-    for (i = 0; i < room->narrative_count; i++) {
-        Narrative *n = &room->narratives[i];
-        int pi = player_by_id(room, n->player_id);
-        if (i) jsonb_append(&b, ",");
-        jsonb_append(&b, "{");
-        jsonb_appendf(&b, "\"id\":%d,", n->id);
-        jsonb_appendf(&b, "\"player_id\":%d,", n->player_id);
-        jsonb_append(&b, "\"player_name\":");
-        if (pi >= 0) jsonb_string(&b, room->players[pi].name);
-        else jsonb_string(&b, "系统");
-        jsonb_append(&b, ",");
-        jsonb_appendf(&b, "\"round\":%d,", n->round);
-        jsonb_append(&b, "\"operation\":");
-        jsonb_string(&b, game_op_name(n->operation));
-        jsonb_append(&b, ",");
-        jsonb_append(&b, "\"content\":");
-        jsonb_string(&b, n->content);
-        jsonb_append(&b, ",");
-        jsonb_append(&b, "\"limit_keyword\":");
-        jsonb_string(&b, n->limit_keyword);
-        jsonb_appendf(&b, ",\"target_id\":%d", n->target_id);
-        jsonb_appendf(&b, ",\"damage\":%d", n->damage);
-        jsonb_appendf(&b, ",\"calamity\":%s", n->calamity ? "true" : "false");
-        jsonb_appendf(&b, ",\"notice\":%s", n->notice ? "true" : "false");
-        jsonb_appendf(&b, ",\"green\":%s", n->green ? "true" : "false");
-        jsonb_appendf(&b, ",\"roll_used\":%s", n->roll_used ? "true" : "false");
-        jsonb_appendf(&b, ",\"roll_value\":%d", n->roll_value);
-        jsonb_appendf(&b, ",\"roll_chance\":%d", n->roll_chance);
-        jsonb_appendf(&b, ",\"roll_success\":%s", n->roll_success ? "true" : "false");
-        jsonb_append(&b, ",\"roll_note\":");
-        jsonb_string(&b, n->roll_note);
-        jsonb_append(&b, "}");
+    {
+        int first = 1;
+        int last_round = -1;
+        for (i = 0; i < room->narrative_count; i++) {
+            Narrative *n = &room->narratives[i];
+            int pi = player_by_id(room, n->player_id);
+            /* 进入新回合时，先把上一回合的濒死警告事件写进时间线。 */
+            if (last_round >= 0 && n->round != last_round) {
+                append_record_warning_events(&b, room, last_round, &first);
+            }
+            if (!first) jsonb_append(&b, ",");
+            jsonb_append(&b, "{");
+            jsonb_appendf(&b, "\"id\":%d,", n->id);
+            jsonb_appendf(&b, "\"player_id\":%d,", n->player_id);
+            jsonb_append(&b, "\"player_name\":");
+            if (pi >= 0) jsonb_string(&b, room->players[pi].name);
+            else jsonb_string(&b, "系统");
+            jsonb_append(&b, ",");
+            jsonb_appendf(&b, "\"round\":%d,", n->round);
+            jsonb_append(&b, "\"operation\":");
+            jsonb_string(&b, game_op_name(n->operation));
+            jsonb_append(&b, ",");
+            jsonb_append(&b, "\"content\":");
+            jsonb_string(&b, n->content);
+            jsonb_append(&b, ",");
+            jsonb_append(&b, "\"limit_keyword\":");
+            jsonb_string(&b, n->limit_keyword);
+            jsonb_appendf(&b, ",\"target_id\":%d", n->target_id);
+            jsonb_appendf(&b, ",\"damage\":%d", n->damage);
+            jsonb_appendf(&b, ",\"calamity\":%s", n->calamity ? "true" : "false");
+            jsonb_appendf(&b, ",\"notice\":%s", n->notice ? "true" : "false");
+            jsonb_appendf(&b, ",\"green\":%s", n->green ? "true" : "false");
+            jsonb_appendf(&b, ",\"roll_used\":%s", n->roll_used ? "true" : "false");
+            jsonb_appendf(&b, ",\"roll_value\":%d", n->roll_value);
+            jsonb_appendf(&b, ",\"roll_chance\":%d", n->roll_chance);
+            jsonb_appendf(&b, ",\"roll_success\":%s", n->roll_success ? "true" : "false");
+            jsonb_append(&b, ",\"roll_note\":");
+            jsonb_string(&b, n->roll_note);
+            jsonb_append(&b, "}");
+            first = 0;
+            last_round = n->round;
+        }
+        if (last_round >= 0) append_record_warning_events(&b, room, last_round, &first);
     }
     jsonb_append(&b, "],");
 
@@ -2458,6 +2622,8 @@ static void save_room_record(Room *room)
         jsonb_appendf(&b, "\"source_id\":%d,", w->source_id);
         jsonb_appendf(&b, "\"narrative_id\":%d,", w->narrative_id);
         jsonb_appendf(&b, "\"resolved\":%s,", w->resolved ? "true" : "false");
+        jsonb_appendf(&b, "\"created_round\":%d,", w->created_round);
+        jsonb_appendf(&b, "\"resolved_round\":%d,", w->resolved_round);
         jsonb_append(&b, "\"reason\":");
         jsonb_string(&b, w->reason);
         jsonb_append(&b, "}");
@@ -2577,6 +2743,7 @@ static void apply_damage(Room *room, int target_id, int damage, int source_id,
         w->source_id = source_id;
         w->narrative_id = 0;
         w->resolved = 0;
+            w->created_round = room->round;
         snprintf(w->reason, sizeof(w->reason), "你感到体力正在快速流失，视线逐渐模糊");
         debug_log("[warning_create] room=%d victim=%d source=%d reason=%s",
                   room->id, target_id, source_id, w->reason);
@@ -2598,6 +2765,7 @@ static void ensure_warning_before_death(Room *room, int victim_id, int source_id
         w->source_id = source_id;
         w->narrative_id = 0;
         w->resolved = 0;
+            w->created_round = room->round;
         snprintf(w->reason, sizeof(w->reason), "你已无力再战，只能任人处置");
         debug_log("[warning_create] room=%d victim=%d source=%d reason=%s",
                   room->id, victim_id, source_id, w->reason);

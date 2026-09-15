@@ -60,6 +60,13 @@ int json_get_int(const JsonValue *obj, const char *key, int dflt)
     return dflt;
 }
 
+long long json_get_longlong(const JsonValue *obj, const char *key, long long dflt)
+{
+    JsonValue *v = json_get(obj, key);
+    if (v && v->type == JSON_NUMBER) return (long long)v->num;
+    return dflt;
+}
+
 /* ------------------------------------------------------------------ */
 /* Parser                                                              */
 /* ------------------------------------------------------------------ */

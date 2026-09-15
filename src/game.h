@@ -66,6 +66,8 @@ typedef struct Warning {
     int source_id;
     int narrative_id;
     int resolved;
+    int created_round;   /* 警告创建时的回合，用于回放时间线 */
+    int resolved_round;  /* 警告解除或结算时的回合，用于回放时间线 */
     char reason[256];
 } Warning;
 

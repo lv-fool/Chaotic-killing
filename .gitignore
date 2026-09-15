@@ -3,29 +3,33 @@
 luansha
 luansha.exe
 build/
+*.exe
+*.dll
 
-# 本地密钥与 AI 配置（Phase 0：禁止提交 API Key）
+# 本地密钥与 AI 配置（禁止提交 API Key）
 .luansha_key
 luansha_ai.conf
 *.local.env
+*.env
 
-# 数据（Phase 1 持久化后会用到）
+# 数据文件（持久化后使用）
 *.db
 *.sqlite
 *.sqlite3
 data/
 
-# 客户端构建产物
+# 客户端构建产物与依赖
 dist/
 runtime/
-build/
+venv/
+.venv/
 luansha_client.exe
-luansha_client_py.spec
 luansha_client.exe.WebView2/
 luansha_client_WebView2Loader.dll
 WebView2Loader.dll
 
 # 日志与运行时数据
+*.log
 debug_operations.log
 numeric_audit.log
 cloudflared.log
@@ -38,6 +42,9 @@ client_preview.png
 client_preview_mobile.html
 client_white_check.html
 client_white_check.png
+*.bak
+*.tmp
+*.swp
 
 # Python
 __pycache__/
@@ -45,3 +52,4 @@ __pycache__/
 
 # WorkBuddy 工作区数据（会话记忆等本地运行时数据，勿提交）
 .workbuddy/
+.workbuddy-ai/

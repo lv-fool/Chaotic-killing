@@ -34,6 +34,7 @@ JsonValue *json_get(const JsonValue *obj, const char *key);
 /* Convenience getters. Defaults are returned when missing/mismatched. */
 const char *json_get_string(const JsonValue *obj, const char *key, const char *dflt);
 int json_get_int(const JsonValue *obj, const char *key, int dflt);
+long long json_get_longlong(const JsonValue *obj, const char *key, long long dflt);
 
 /* Minimal JSON output buffer. */
 typedef struct JsonBuf {

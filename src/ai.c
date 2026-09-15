@@ -655,7 +655,7 @@ static int ai_complete_text(const char *system_prompt, const char *user_prompt,
     const char *api_model = ai_get_model();
     const char *debug = getenv("LUANSHA_AI_DEBUG");
     char ai_url[512];
-    char request_body[4096];
+    char request_body[16384];
     char response[AI_RESPONSE_MAX];
     JsonBuf b;
     JsonValue *root = NULL;
@@ -671,7 +671,10 @@ static int ai_complete_text(const char *system_prompt, const char *user_prompt,
     jsonb_init(&b);
     jsonb_append(&b, "{\"model\":");
     jsonb_string(&b, model);
-    jsonb_append(&b, ",\"temperature\":0.7,\"stream\":false,\"max_tokens\":200,\"thinking\":{\"type\":\"disabled\"},\"messages\":[");
+    jsonb_append(&b, ",\"temperature\":0.9,\"top_p\":0.95,"
+                     "\"presence_penalty\":0.6,\"frequency_penalty\":0.5,"
+                     "\"stream\":false,\"max_tokens\":300,"
+                     "\"thinking\":{\"type\":\"disabled\"},\"messages\":[");
     jsonb_append(&b, "{\"role\":\"system\",\"content\":");
     jsonb_string(&b, system_prompt ? system_prompt : "");
     jsonb_append(&b, "},{\"role\":\"user\",\"content\":");
@@ -1180,45 +1183,61 @@ int ai_try_generate_narration(
     const char *ai_name,
     const char *recent_text,
     const char *constraint,
+    const char *avoid_text,
     char *out,
     size_t out_size)
 {
     const char *debug = getenv("LUANSHA_AI_DEBUG");
-    char system_prompt[1024];
-    char user_prompt[2048];
+    char system_prompt[2048];
+    char user_prompt[6144];
     int ok;
 
     if (!out || out_size == 0) return 0;
     out[0] = '\0';
 
+    /* 结构：角色 → 目标 → 硬规则 → 写法与示范 → 输出格式。
+       长 prompt 里权重最高的是开头和结尾，所以把"操作类型/约束/禁重复清单"
+       放在 user 段的靠后位置紧贴输出，而不是埋在 system 的中段。 */
     snprintf(system_prompt, sizeof(system_prompt),
-        "你是《乱杀法则》跑团游戏中的AI玩家%s。"
-        "请根据当前情况说出一句话的行动/发言。"
-        "要求：只能说一句话；不能使用连词；不要直接操控其他玩家的主意识；"
-        "不要使用固定的模板句，不要重复前面已经说过的话；"
-        "尽量自由创造独特、合理的行动；优先选择有攻击性的行动，"
-        "例如创造武器、设置陷阱、布置伏击、破坏环境、主动出击或制造威胁；"
-        "也可以观察、移动、试探、谈判；"
-        "必须给出具体动作，禁止只说“我向X发起攻击”这种笼统描述；"
-        "必须基于当前房间/场景中的真实物体和物理规则，禁止时间倒流、黑洞、"
-        "撕下影子/骨骼、数据化、超能力等脱离场景的设定；"
-        "不得突然切换到前文未出现过的新场景/新房间；"
-        "只能延续当前场景与最近发言中出现过的地点、物品和设施；"
-        "不得复制或高度模仿其他玩家或自己之前的发言；"
-        "不要输出解释、不要加引号、不要输出JSON。",
-        ai_name ? ai_name : "");
+        "你是《乱杀法则》跑团游戏里的 AI 玩家「%s」，正在参与一场虚构的对抗叙事。\n"
+        "\n"
+        "【目标】活到最后，并设法让其他玩家陷入死地。\n"
+        "\n"
+        "【硬性规则】\n"
+        "1. 只写一句话，只能有一个谓语，不能用连词"
+        "（但是/而且/同时/然后/接着/因为/所以）。\n"
+        "2. 不直接操控别人的主意识：只能写自己的动作，以及发生在别人身上的遭遇。\n"
+        "3. 只能用当前场景里已经出现过的地点、物品、设施。禁止凭空切换场景、"
+        "超能力、时间倒流、数据化、撕下影子或骨骼这类脱离场景的设定。\n"
+        "4. 禁止复述或改写「已说过的话」里的任何一句，也不许只换几个字。\n"
+        "\n"
+        "【写法要求】\n"
+        "- 必须是一个具体、看得见画面的物理动作，带上用到的物件和朝向。\n"
+        "- 禁止「我发起攻击」「我观察四周」「我保持警惕」「我等待时机」这类笼统套话。\n"
+        "- 下面只示范具体到什么程度，不要照抄：\n"
+        "  创造 → 我把拖把杆拆下来，用碎布缠住一头，点成火把。\n"
+        "  扭曲 → 我踢翻脚边的油桶，让汽油朝门口蔓延过去。\n"
+        "  解释 → 我按住肋下的伤口，把身体挪到货架背后。\n"
+        "  陈述 → 我数着对面那人换弹的动作，趁间隙冲过通道。\n"
+        "\n"
+        "【输出】只输出那一句话本身。不要引号、不要解释、不要 JSON、不要序号。",
+        ai_name ? ai_name : "AI");
 
     snprintf(user_prompt, sizeof(user_prompt),
-        "房间名：%s\n"
-        "在线玩家：%s\n"
+        "房间：%s\n"
+        "在场玩家：%s\n"
         "你：%s\n"
-        "最近发言：%s\n"
-        "当前约束：%s",
+        "最近发生的事：\n"
+        "%s\n"
+        "本回合要求：%s\n"
+        "你之前说过的话（禁止重复其中任何一句）：\n"
+        "%s",
         room_name ? room_name : "未知",
         players_text ? players_text : "无",
         ai_name ? ai_name : "AI",
-        recent_text && *recent_text ? recent_text : "暂无",
-        constraint && *constraint ? constraint : "无");
+        recent_text && *recent_text ? recent_text : "（还没有人发言）",
+        constraint && *constraint ? constraint : "无",
+        avoid_text && *avoid_text ? avoid_text : "（你还没有说过话）");
 
     ok = ai_complete_text(system_prompt, user_prompt, out, out_size);
     if (ok && debug && *debug) fprintf(stderr, "[AI] generation ok: %s\n", out);
@@ -1276,6 +1295,7 @@ int ai_try_generate_attack(
     const char *ai_name,
     const char *recent_text,
     const char *constraint,
+    const char *avoid_text,
     char *content_out, size_t content_size,
     char *target_out, size_t target_size,
     int *danger_out,
@@ -1283,8 +1303,8 @@ int ai_try_generate_attack(
     char *reason_out, size_t reason_size)
 {
     const char *debug = getenv("LUANSHA_AI_DEBUG");
-    char system_prompt[1400];
-    char user_prompt[2048];
+    char system_prompt[2560];
+    char user_prompt[6144];
     char out[1024];
     JsonValue *v = NULL;
     const char *js, *je;
@@ -1303,29 +1323,47 @@ int ai_try_generate_attack(
     if (reason_out && reason_size > 0) reason_out[0] = '\0';
 
     snprintf(system_prompt, sizeof(system_prompt),
-        "你是《乱杀法则》跑团游戏中的AI玩家%s。"
-        "请根据当前局势，选择一名其他玩家作为威胁/进攻目标，并写出你的一句话行动。"
-        "规则：只能说一句话；不能使用连词；不能直接操控其他玩家的主意识；"
-        "进攻必须符合当前场景和前面发言的铺垫，可以布置陷阱、使用已创造/已获得的物品、"
-        "利用环境、近战、投毒、伏击等，但必须逻辑合理。"
-        "必须给出具体动作，禁止只说“我向X发起攻击”这种笼统描述；"
-        "必须基于当前房间/场景中的真实物体和物理规则，禁止时间倒流、黑洞、"
-        "撕下影子/骨骼、数据化、超能力等脱离场景的设定；"
-        "不得突然切换到前文未出现过的新场景/新房间；"
-        "只能延续当前场景与最近发言中出现过的地点、物品和设施；"
-        "不得复制或高度模仿其他玩家或自己之前的发言；"
-        "只输出JSON，不要输出其他文字，格式："
-        "{\"target\":\"目标玩家名\",\"content\":\"你的一句话行动\",\"danger\":true或false,\"damage\":1到3,\"reason\":\"简短原因\"}"
-        "其中danger表示这句话是否足以造成致命威胁/濒死状态，damage表示实际造成的伤害值（1=轻伤，2=重伤，3=致命）。",
-        ai_name ? ai_name : "");
+        "你是《乱杀法则》跑团游戏里的 AI 玩家「%s」，正在参与一场虚构的对抗叙事。\n"
+        "\n"
+        "【目标】活到最后。这一回合你要主动出手，让某一名其他玩家陷入死地。\n"
+        "\n"
+        "【硬性规则】\n"
+        "1. 只写一句话，只能有一个谓语，不能用连词"
+        "（但是/而且/同时/然后/接着/因为/所以）。\n"
+        "2. 不直接操控别人的主意识：只能写自己的动作，以及发生在别人身上的遭遇。\n"
+        "3. 只能用当前场景里已经出现过的地点、物品、设施。禁止凭空切换场景、"
+        "超能力、时间倒流、数据化、撕下影子或骨骼这类脱离场景的设定。\n"
+        "4. 禁止复述或改写「已说过的话」里的任何一句。\n"
+        "\n"
+        "【进攻写法】\n"
+        "- 必须具体：写清用什么、怎么用、打向哪里。禁止「我向X发起攻击」这种笼统描述。\n"
+        "- 可以布置陷阱、使用已创造或已获得的物品、利用环境、近战、投毒、伏击。\n"
+        "- 下面只示范具体到什么程度，不要照抄：\n"
+        "  我把货架上的玻璃罐扫落，让碎玻璃铺满他退向门口的那条路。\n"
+        "  我拧开墙边的煤气管，把打火机攥在手里等他转身。\n"
+        "\n"
+        "【输出格式】只输出 JSON，不要任何其他文字：\n"
+        "{\"target\":\"目标玩家名\",\"content\":\"你的一句话行动\","
+        "\"danger\":true或false,\"damage\":1到3,\"reason\":\"简短原因\"}\n"
+        "danger 表示这句话是否足以造成致命威胁/濒死状态；"
+        "damage 表示实际伤害值（1=轻伤，2=重伤，3=致命）。",
+        ai_name ? ai_name : "AI");
 
     snprintf(user_prompt, sizeof(user_prompt),
-        "房间名：%s\n在线玩家：%s\n你：%s\n最近发言：%s\n当前约束：%s",
+        "房间：%s\n"
+        "在场玩家：%s\n"
+        "你：%s\n"
+        "最近发生的事：\n"
+        "%s\n"
+        "本回合要求：%s\n"
+        "你之前说过的话（禁止重复其中任何一句）：\n"
+        "%s",
         room_name ? room_name : "未知",
         players_text ? players_text : "无",
         ai_name ? ai_name : "AI",
-        recent_text && *recent_text ? recent_text : "暂无",
-        constraint && *constraint ? constraint : "无");
+        recent_text && *recent_text ? recent_text : "（还没有人发言）",
+        constraint && *constraint ? constraint : "无",
+        avoid_text && *avoid_text ? avoid_text : "（你还没有说过话）");
 
     if (ai_complete_text(system_prompt, user_prompt, out, sizeof(out)) != 1) return 0;
 
@@ -1376,13 +1414,14 @@ int ai_try_generate_rescue(
     const char *ai_name,
     const char *recent_text,
     const char *constraint,
+    const char *avoid_text,
     char *content_out, size_t content_size,
     int *rescued_out,
     char *reason_out, size_t reason_size)
 {
     const char *debug = getenv("LUANSHA_AI_DEBUG");
-    char system_prompt[1400];
-    char user_prompt[2048];
+    char system_prompt[2560];
+    char user_prompt[6144];
     char out[1024];
     JsonValue *v = NULL;
     const char *js, *je;
@@ -1397,26 +1436,46 @@ int ai_try_generate_rescue(
     if (reason_out && reason_size > 0) reason_out[0] = '\0';
 
     snprintf(system_prompt, sizeof(system_prompt),
-        "你是《乱杀法则》跑团游戏中的AI玩家%s。"
-        "你现在正处于濒死状态，必须立即自救。"
-        "请根据当前场景和已有铺垫，说出一句合理、简短的自救行动。"
-        "规则：只能说一句话；不能使用连词；不能直接操控其他玩家的主意识；"
-        "必须明确描述如何躲开/挡下/防御/化解/挣脱/恢复/逃离这次致命威胁；"
-        "自救必须基于当前场景中的物体、地形和身体状况，禁止变成非人形态、"
-        "时间倒流、数据化、超能力等脱离场景的设定；"
-        "不得复制或高度模仿其他玩家或自己之前的发言；"
-        "只输出JSON，不要输出其他文字，格式："
-        "{\"content\":\"你的一句话自救行动\",\"rescued\":true或false,\"reason\":\"简短原因\"}"
-        "其中rescued表示这句话是否足以让自己脱离濒死状态。",
-        ai_name ? ai_name : "");
+        "你是《乱杀法则》跑团游戏里的 AI 玩家「%s」，正在参与一场虚构的对抗叙事。\n"
+        "\n"
+        "【处境】你正处于濒死状态，必须在这一句话里自救，否则会被宣告死亡。\n"
+        "\n"
+        "【硬性规则】\n"
+        "1. 只写一句话，只能有一个谓语，不能用连词"
+        "（但是/而且/同时/然后/接着/因为/所以）。\n"
+        "2. 不直接操控别人的主意识：只能写自己的动作。\n"
+        "3. 只能用当前场景里已经出现过的物体、地形，以及你自己的身体状况。"
+        "禁止变成非人形态、超能力、时间倒流、数据化这类脱离场景的设定。\n"
+        "4. 禁止复述或改写「已说过的话」里的任何一句。\n"
+        "\n"
+        "【自救写法】\n"
+        "- 必须写清如何躲开/挡下/挣脱/恢复/逃离这次致命威胁，并说明借助了什么。\n"
+        "- 禁止「我躲开了这次攻击」这种笼统描述。\n"
+        "- 下面只示范具体到什么程度，不要照抄：\n"
+        "  我抓住货架边缘把自己荡开，让那根钢管砸进身后的木箱里。\n"
+        "  我扯下外套裹住小臂，硬接下这一刀并顺势夺过刀柄。\n"
+        "\n"
+        "【输出格式】只输出 JSON，不要任何其他文字：\n"
+        "{\"content\":\"你的一句话自救行动\",\"rescued\":true或false,"
+        "\"reason\":\"简短原因\"}\n"
+        "rescued 表示这句话是否足以让你脱离濒死状态。",
+        ai_name ? ai_name : "AI");
 
     snprintf(user_prompt, sizeof(user_prompt),
-        "房间名：%s\n在线玩家：%s\n你：%s\n最近发言：%s\n当前约束：%s",
+        "房间：%s\n"
+        "在场玩家：%s\n"
+        "你：%s\n"
+        "最近发生的事：\n"
+        "%s\n"
+        "本回合要求：%s\n"
+        "你之前说过的话（禁止重复其中任何一句）：\n"
+        "%s",
         room_name ? room_name : "未知",
         players_text ? players_text : "无",
         ai_name ? ai_name : "AI",
-        recent_text && *recent_text ? recent_text : "暂无",
-        constraint && *constraint ? constraint : "无");
+        recent_text && *recent_text ? recent_text : "（还没有人发言）",
+        constraint && *constraint ? constraint : "无",
+        avoid_text && *avoid_text ? avoid_text : "（你还没有说过话）");
 
     if (ai_complete_text(system_prompt, user_prompt, out, sizeof(out)) != 1) return 0;
 

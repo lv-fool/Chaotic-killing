@@ -46,7 +46,7 @@ const get = (port, p) => request('GET', port, p, null);
 const post = (port, p, b) => request('POST', port, p, b);
 
 function parsePlayers(body) {
-  const m = body.match(/在线玩家：([^\n]+)/);
+  const m = body.match(/(?:在线玩家|在场玩家)：([^\n]+)/);
   if (!m) return [];
   return m[1].split(/[,，]/).map(s => s.trim()).filter(Boolean);
 }
@@ -111,6 +111,7 @@ function startFakeServer() {
 
 function startGameServer() {
   return new Promise((resolve, reject) => {
+    const gameBin = process.env.SIM_GAME_BIN || 'luansha.exe';
     const env = {
       ...process.env,
       LUANSHA_AI_URL: `http://127.0.0.1:${fakePort}/chat/completions`,
@@ -120,7 +121,7 @@ function startGameServer() {
       LUANSHA_RATE_LIMIT_MAX: '1000000',
       LUANSHA_RATE_LIMIT_WINDOW: '1'
     };
-    const child = spawn(path.join(cwd, 'luansha.exe'), ['--no-open', String(gamePort)], {
+    const child = spawn(path.join(cwd, gameBin), ['--no-open', String(gamePort)], {
       cwd,
       env,
       stdio: ['ignore', 'pipe', 'pipe']
@@ -205,7 +206,8 @@ async function playOneGame(gameIndex) {
     }
   } finally {
     if (gameProc) {
-      try { execSync('taskkill //F //IM luansha.exe >/dev/null 2>&1'); } catch (e) {}
+      const binName = process.env.SIM_GAME_BIN || 'luansha.exe';
+      try { execSync(`taskkill //F //IM ${binName} >/dev/null 2>&1`); } catch (e) {}
       gameProc.kill();
     }
     if (fakeServer) fakeServer.close();

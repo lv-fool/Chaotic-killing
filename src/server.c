@@ -449,12 +449,14 @@ static char *read_file_alloc(const char *path, size_t *out_len)
     return buf;
 }
 
-static void append_record_summary(JsonBuf *out, const char *path)
+static void append_record_summary(JsonBuf *out, const char *path,
+                                  int *first, long long *seen, int *seen_count)
 {
     char *text = read_file_alloc(path, NULL);
     JsonValue *v;
     JsonValue *players, *narratives;
-    int record_id, room_id, difficulty, winner_id, player_count, narrative_count;
+    long long record_id;
+    int room_id, difficulty, winner_id, player_count, narrative_count;
     const char *name, *created_at, *winner_name = "";
     int i;
 
@@ -463,7 +465,7 @@ static void append_record_summary(JsonBuf *out, const char *path)
     free(text);
     if (!v) return;
 
-    record_id = json_get_int(v, "record_id", 0);
+    record_id = json_get_longlong(v, "record_id", 0);
     room_id = json_get_int(v, "room_id", 0);
     name = json_get_string(v, "name", "");
     difficulty = json_get_int(v, "difficulty", 0);
@@ -483,8 +485,22 @@ static void append_record_summary(JsonBuf *out, const char *path)
         }
     }
 
+    /* 多目录扫描时按 record_id 去重：优先保留先扫描到的目录（当前目录优先）。 */
+    if (seen && seen_count) {
+        for (i = 0; i < *seen_count; i++) {
+            if (seen[i] == record_id) {
+                json_free(v);
+                return;
+            }
+        }
+        if (*seen_count < 512) seen[(*seen_count)++] = record_id;
+    }
+
+    if (first && !*first) jsonb_append(out, ",");
+    if (first) *first = 0;
+
     jsonb_append(out, "{");
-    jsonb_appendf(out, "\"record_id\":%d,", record_id);
+    jsonb_appendf(out, "\"record_id\":%lld,", record_id);
     jsonb_appendf(out, "\"room_id\":%d,", room_id);
     jsonb_append(out, "\"name\":");
     jsonb_string(out, name);
@@ -501,57 +517,78 @@ static void append_record_summary(JsonBuf *out, const char *path)
     json_free(v);
 }
 
+static void collect_record_summaries(JsonBuf *b, const char *dir,
+                                     int *first, long long *seen, int *seen_count)
+{
+#ifdef _WIN32
+    struct _finddata_t fd;
+    intptr_t h;
+    char pattern[WEB_PATH_MAX];
+    snprintf(pattern, sizeof(pattern), "%s/*.json", dir);
+    h = _findfirst(pattern, &fd);
+    if (h != -1) {
+        do {
+            char path[WEB_PATH_MAX];
+            snprintf(path, sizeof(path), "%s/%s", dir, fd.name);
+            append_record_summary(b, path, first, seen, seen_count);
+        } while (_findnext(h, &fd) == 0);
+        _findclose(h);
+    }
+#else
+    DIR *d = opendir(dir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            size_t n = strlen(e->d_name);
+            if (n > 5 && strcmp(e->d_name + n - 5, ".json") == 0) {
+                char path[WEB_PATH_MAX];
+                snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+                append_record_summary(b, path, first, seen, seen_count);
+            }
+        }
+        closedir(d);
+    }
+#endif
+}
+
 static void send_records_list(socket_t client)
 {
     JsonBuf b;
     int first = 1;
+    long long seen[512] = {0};
+    int seen_count = 0;
     jsonb_init(&b);
     jsonb_append(&b, "{\"ok\":true,\"records\":[");
-#ifdef _WIN32
-    {
-        struct _finddata_t fd;
-        intptr_t h = _findfirst("records/*.json", &fd);
-        if (h != -1) {
-            do {
-                char path[WEB_PATH_MAX];
-                snprintf(path, sizeof(path), "records/%s", fd.name);
-                if (!first) jsonb_append(&b, ",");
-                append_record_summary(&b, path);
-                first = 0;
-            } while (_findnext(h, &fd) == 0);
-            _findclose(h);
-        }
-    }
-#else
-    {
-        DIR *d = opendir("records");
-        if (d) {
-            struct dirent *e;
-            while ((e = readdir(d)) != NULL) {
-                size_t n = strlen(e->d_name);
-                if (n > 5 && strcmp(e->d_name + n - 5, ".json") == 0) {
-                    char path[WEB_PATH_MAX];
-                    snprintf(path, sizeof(path), "records/%s", e->d_name);
-                    if (!first) jsonb_append(&b, ",");
-                    append_record_summary(&b, path);
-                    first = 0;
-                }
-            }
-            closedir(d);
-        }
-    }
-#endif
+    /* 兼容两种启动位置：
+       1. 根目录运行：records/
+       2. dist 子目录运行（桌面客户端）：records/ + ../records/ */
+    collect_record_summaries(&b, "records", &first, seen, &seen_count);
+    collect_record_summaries(&b, "../records", &first, seen, &seen_count);
     jsonb_append(&b, "]}");
     send_json(client, &b);
     jsonb_free(&b);
 }
 
-static void send_record_detail(socket_t client, int record_id)
+static void send_record_detail(socket_t client, long long record_id)
 {
     char path[WEB_PATH_MAX];
     char *text;
-    snprintf(path, sizeof(path), "records/room_%d.json", record_id);
+    /* 新回放：record_<record_id>.json */
+    snprintf(path, sizeof(path), "records/record_%lld.json", record_id);
     text = read_file_alloc(path, NULL);
+    if (!text) {
+        snprintf(path, sizeof(path), "../records/record_%lld.json", record_id);
+        text = read_file_alloc(path, NULL);
+    }
+    /* 兼容旧回放：room_<room_id>.json（旧记录 record_id=room_id） */
+    if (!text) {
+        snprintf(path, sizeof(path), "records/room_%lld.json", record_id);
+        text = read_file_alloc(path, NULL);
+    }
+    if (!text) {
+        snprintf(path, sizeof(path), "../records/room_%lld.json", record_id);
+        text = read_file_alloc(path, NULL);
+    }
     if (!text) {
         send_error_json(client, "Record not found");
         return;
@@ -860,7 +897,7 @@ static void handle_api(socket_t client, HttpRequest *req)
         const char *q = req->query;
         char value[64];
         if (query_param(q, "id", value, sizeof(value))) {
-            send_record_detail(client, atoi(value));
+            send_record_detail(client, strtoll(value, NULL, 10));
         } else {
             send_records_list(client);
         }
